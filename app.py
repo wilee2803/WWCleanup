@@ -1,7 +1,7 @@
 """
 WW Duplikat-Erkennung
 Streamlit App zur Erkennung und Bereinigung von Duplikaten in Weindaten.
-Unterstützt: Rebsorten, Weinbauregionen, Winzer
+Unterstützt: Rebsorten, Weinbauregionen, Winzer, Weine
 """
 
 import io
@@ -52,6 +52,28 @@ FILE_CONFIGS = {
         "split_dash":      False,
         "cuvee_detection": False,
         "out_file":        "producer_cleaned.csv",
+    },
+    "product": {
+        "label":              "Weine",
+        "file":               os.path.join(BASE_DIR, "Datafiles", "product.csv"),
+        "col_id":             0,    # Product.Id
+        "col_name":           3,    # Title
+        "col_group":          None, # wird beim Laden als _group gesetzt
+        "group_label":        "Gruppe",
+        "group_label_metric": "Wein-Gruppen",
+        "split_dash":         False,
+        "cuvee_detection":    False,
+        "out_file":           "product_cleaned.csv",
+        # Produkt-spezifisch: zusammengesetzter Gruppierschlüssel
+        "composite_group":    True,
+        "col_producer_id":    2,    # ProducerId
+        "col_year":           6,    # ProductionYear
+        "col_bottle":         15,   # BottleSize
+        "col_wine_type_id":   18,   # GrapeVarietyGroupId (Weinsorte)
+        "col_grape_id":       19,   # GrapeVarietyId      (Rebsorte)
+        # Joined-Spalten (pandas benennt Duplikate um):
+        "col_wine_type_name": 44,   # Title.1  → GrapeVarityGroup.Title
+        "col_producer_name":  48,   # ShortName → Producer.ShortName
     },
 }
 
@@ -213,15 +235,33 @@ with st.sidebar:
         if raw is not None:
             df_new, enc = load_csv(raw)
             if df_new is not None:
-                st.session_state.df                  = df_new
-                st.session_state.encoding            = enc
-                st.session_state.config              = active_config
+                st.session_state.encoding  = enc
+                st.session_state.config    = active_config
                 st.session_state.col_id    = df_new.columns[active_config["col_id"]]
                 st.session_state.col_name  = df_new.columns[active_config["col_name"]]
-                col_group_idx              = active_config["col_group"]
-                st.session_state.col_group = (
-                    df_new.columns[col_group_idx] if col_group_idx is not None else None
-                )
+
+                if active_config.get("composite_group"):
+                    # Zusammengesetzten Gruppierschlüssel aus 5 Feldern aufbauen
+                    c_prod  = df_new.columns[active_config["col_producer_name"]]
+                    c_type  = df_new.columns[active_config["col_wine_type_name"]]
+                    c_year  = df_new.columns[active_config["col_year"]]
+                    c_grape = df_new.columns[active_config["col_grape_id"]]
+                    c_btl   = df_new.columns[active_config["col_bottle"]]
+                    df_new["_group"] = (
+                        df_new[c_prod].str.strip() + " / " +
+                        df_new[c_type].str.strip() + " / " +
+                        df_new[c_year].str.strip() + " / " +
+                        df_new[c_grape].str[:8] + " / " +
+                        df_new[c_btl].str[:8]
+                    )
+                    st.session_state.col_group = "_group"
+                else:
+                    col_group_idx = active_config["col_group"]
+                    st.session_state.col_group = (
+                        df_new.columns[col_group_idx] if col_group_idx is not None else None
+                    )
+
+                st.session_state.df                  = df_new
                 st.session_state.candidates          = None
                 st.session_state.decisions           = {}
                 st.session_state.confirmed_cuvee_ids = set()
@@ -313,7 +353,8 @@ with mc1:
     st.metric("Einträge gesamt", len(df))
 with mc2:
     if col_group is not None:
-        st.metric(cfg["group_label"] + "gruppen", df[col_group].nunique())
+        metric_label = cfg.get("group_label_metric", cfg["group_label"] + "gruppen")
+        st.metric(metric_label, df[col_group].nunique())
     else:
         st.metric("Einträge", len(df))
 with mc3:
@@ -486,6 +527,11 @@ st.divider()
 st.subheader("📥 Export")
 
 out_df = df.copy()
+
+# Interne Hilfsspalten nicht exportieren
+for _internal in ["_group"]:
+    if _internal in out_df.columns:
+        out_df = out_df.drop(columns=_internal)
 
 insert_pos = list(out_df.columns).index(col_id) + 1
 out_df.insert(insert_pos, "original_id", "")
