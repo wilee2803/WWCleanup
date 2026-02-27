@@ -440,8 +440,15 @@ else:
 
 # ── Export ─────────────────────────────────────────────────────────────────────
 
-confirmed_pairs = [(k, v) for k, v in st.session_state.decisions.items() if v != "reject"]
-has_cuvee       = (edited_cuvee is not None and bool(edited_cuvee["Cuvée"].any()))
+confirmed_pairs   = [(k, v) for k, v in st.session_state.decisions.items() if v != "reject"]
+has_cuvee         = (edited_cuvee is not None and bool(edited_cuvee["Cuvée"].any()))
+all_pairs_decided = (len(st.session_state.decisions) == len(candidates))
+
+# Export erst anzeigen wenn alle Paare entschieden wurden
+if not all_pairs_decided:
+    remaining = len(candidates) - len(st.session_state.decisions)
+    st.info(f"⏳ Noch **{remaining}** Paare offen — bitte alle entscheiden, dann erscheint der Export.")
+    st.stop()
 
 if not confirmed_pairs and not has_cuvee:
     st.stop()
