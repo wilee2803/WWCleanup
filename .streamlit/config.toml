@@ -1,0 +1,9 @@
+[theme]
+primaryColor        = "#722F37"   # Weinrot
+backgroundColor     = "#FFFFFF"
+secondaryBackgroundColor = "#F5F0EB"
+textColor           = "#1A1A1A"
+font                = "sans serif"
+
+[server]
+maxUploadSize = 50

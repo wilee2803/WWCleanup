@@ -1,0 +1,14 @@
+# Echte Daten – nicht ins Repository
+Datafiles/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Windows
+start.bat
+Thumbs.db
+desktop.ini
