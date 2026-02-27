@@ -17,27 +17,28 @@ from rapidfuzz import fuzz
 
 BASE_DIR = os.path.dirname(__file__)
 
-# Jede Konfiguration beschreibt, wie eine CSV-Datei zu interpretieren ist.
 FILE_CONFIGS = {
     "grapevariety": {
-        "label":        "Rebsorten",
-        "file":         os.path.join(BASE_DIR, "Datafiles", "grapevariety.csv"),
-        "col_id":       13,     # GrapeVarity.Id
-        "col_name":     15,     # GrapeVarity.Title  (was wird verglichen)
-        "col_group":    1,      # GrapeVarityGroup.Title  (Gruppierung: Weintyp)
-        "group_label":  "Weintyp",
-        "split_dash":   False,  # Bindestrich-Trenner NICHT normalisieren
-        "out_file":     "grapevariety_cleaned.csv",
+        "label":           "Rebsorten",
+        "file":            os.path.join(BASE_DIR, "Datafiles", "grapevariety.csv"),
+        "col_id":          13,     # GrapeVarity.Id
+        "col_name":        15,     # GrapeVarity.Title
+        "col_group":       1,      # GrapeVarityGroup.Title  (Weintyp)
+        "group_label":     "Weintyp",
+        "split_dash":      False,
+        "cuvee_detection": True,   # Cuvée-Erkennung aktiv
+        "out_file":        "grapevariety_cleaned.csv",
     },
     "growingregion": {
-        "label":        "Weinbauregionen",
-        "file":         os.path.join(BASE_DIR, "Datafiles", "growingregion.csv"),
-        "col_id":       1,      # Id
-        "col_name":     3,      # Name  (was wird verglichen)
-        "col_group":    0,      # IsoAlp2  (Gruppierung: Land)
-        "group_label":  "Land",
-        "split_dash":   True,   # "Bordeaux - Pauillac" == "Pauillac, Bordeaux"
-        "out_file":     "growingregion_cleaned.csv",
+        "label":           "Weinbauregionen",
+        "file":            os.path.join(BASE_DIR, "Datafiles", "growingregion.csv"),
+        "col_id":          1,      # Id
+        "col_name":        3,      # Name
+        "col_group":       0,      # IsoAlp2  (Land)
+        "group_label":     "Land",
+        "split_dash":      True,
+        "cuvee_detection": False,
+        "out_file":        "growingregion_cleaned.csv",
     },
 }
 
@@ -49,32 +50,32 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Lokal vs. Cloud ────────────────────────────────────────────────────────────
+
+IS_LOCAL = any(os.path.exists(cfg["file"]) for cfg in FILE_CONFIGS.values())
+
 
 # ── Hilfsfunktionen ────────────────────────────────────────────────────────────
 
 def normalize(text: str, split_dash: bool = False) -> str:
-    """Normalisiert einen Namen für den Fuzzy-Vergleich.
-
-    - Entfernt Akzente/Diakritika
-    - Kleinschreibung + Whitespace normalisieren
-    - split_dash=True: ' - ' wird zu ', ' (z.B. 'Bordeaux - Pauillac' → sortierbar)
-    - Tokens werden alphabetisch sortiert (Blend-/Kombinations-Reihenfolge egal)
-    """
+    """Normalisiert einen Namen für den Fuzzy-Vergleich."""
     if pd.isna(text) or str(text).strip().upper() in ("NULL", "NONE", ""):
         return ""
     text = str(text)
-    # Akzente entfernen (NFD → Combining-Zeichen raus)
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
-    # Kleinschreibung + Whitespace
     text = re.sub(r"\s+", " ", text).lower().strip()
-    # Bindestrich-Trenner normalisieren (nur für Regionen)
-    # Nur " - " mit Leerzeichen — NICHT Bindestriche in Ortsnamen wie "Savigny-les-Beaune"
     if split_dash:
         text = re.sub(r"\s+-\s+", ", ", text)
-    # Tokens alphabetisch sortieren → Reihenfolge spielt keine Rolle
     tokens = sorted(t.strip() for t in text.split(",") if t.strip())
     return ", ".join(tokens)
+
+
+def is_cuvee(name: str) -> bool:
+    """True wenn der Name mehrere Rebsorten enthält (kommagetrennt = Cuvée)."""
+    if not name or str(name).strip().upper() in ("NULL", "NONE", ""):
+        return False
+    return "," in str(name)
 
 
 def load_csv(source) -> tuple[pd.DataFrame | None, str | None]:
@@ -103,11 +104,9 @@ def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
         valid = valid[valid[name_col].notna()].reset_index(drop=True)
         if len(valid) < 2:
             continue
-
         ids   = valid[id_col].tolist()
         names = valid[name_col].tolist()
         norms = [normalize(n, split_dash=split_dash) for n in names]
-
         n = len(ids)
         for i in range(n):
             if not norms[i]:
@@ -125,27 +124,21 @@ def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
                         "name_b": names[j],
                         "score":  round(score, 1),
                     })
-
     return sorted(candidates, key=lambda x: (-x["score"], x["group"], x["name_a"]))
 
-
-# ── Lokal vs. Cloud erkennen ───────────────────────────────────────────────────
-# Auf Streamlit Community Cloud existieren die lokalen Dateien nicht.
-# In diesem Fall wird der "Standard-Datei"-Modus ausgeblendet.
-
-IS_LOCAL = any(os.path.exists(cfg["file"]) for cfg in FILE_CONFIGS.values())
 
 # ── Session State Init ─────────────────────────────────────────────────────────
 
 _defaults: dict = {
-    "df":         None,
-    "encoding":   None,
-    "config":     None,   # aktive FILE_CONFIGS-Einträge
-    "candidates": None,   # None = noch nicht analysiert, [] = keine Treffer
-    "decisions":  {},     # {(id_a, id_b): 'original_a' | 'original_b' | 'reject'}
-    "col_id":     None,
-    "col_name":   None,
-    "col_group":  None,
+    "df":             None,
+    "encoding":       None,
+    "config":         None,
+    "candidates":     None,   # None = nicht analysiert, [] = keine Treffer
+    "decisions":      {},     # {(id_a, id_b): 'original_a' | 'original_b' | 'reject'}
+    "col_id":         None,
+    "col_name":       None,
+    "col_group":      None,
+    "analysis_count": 0,      # wird bei jedem Analysestart erhöht → setzt Cuvée-Editor zurück
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -157,15 +150,13 @@ for _k, _v in _defaults.items():
 with st.sidebar:
     st.title("⚙️ Einstellungen")
 
-    # Datentyp-Auswahl
-    dtype_options = {cfg["label"]: key for key, cfg in FILE_CONFIGS.items()}
+    dtype_options  = {cfg["label"]: key for key, cfg in FILE_CONFIGS.items()}
     selected_label = st.radio("Datentyp", list(dtype_options.keys()))
     selected_key   = dtype_options[selected_label]
     active_config  = FILE_CONFIGS[selected_key]
 
     st.divider()
 
-    # Quelle: Standard-Datei (nur lokal) oder Upload
     if IS_LOCAL:
         source_mode = st.radio("Quelle", ["Standard-Datei", "CSV hochladen"],
                                label_visibility="collapsed")
@@ -187,17 +178,18 @@ with st.sidebar:
         if raw is not None:
             df, enc = load_csv(raw)
             if df is not None:
-                st.session_state.df         = df
-                st.session_state.encoding   = enc
-                st.session_state.config     = active_config
-                st.session_state.col_id     = df.columns[active_config["col_id"]]
-                st.session_state.col_name   = df.columns[active_config["col_name"]]
-                st.session_state.col_group  = df.columns[active_config["col_group"]]
-                st.session_state.candidates = None
-                st.session_state.decisions  = {}
+                st.session_state.df             = df
+                st.session_state.encoding       = enc
+                st.session_state.config         = active_config
+                st.session_state.col_id         = df.columns[active_config["col_id"]]
+                st.session_state.col_name       = df.columns[active_config["col_name"]]
+                st.session_state.col_group      = df.columns[active_config["col_group"]]
+                st.session_state.candidates     = None
+                st.session_state.decisions      = {}
+                st.session_state.analysis_count = 0
                 st.success(f"✓ {len(df)} Zeilen geladen  \nKodierung: {enc}")
             else:
-                st.error("Datei konnte nicht gelesen werden.\nBitte Encoding/Format prüfen.")
+                st.error("Datei konnte nicht gelesen werden.")
         else:
             st.warning("Keine Datei ausgewählt.")
 
@@ -205,8 +197,7 @@ with st.sidebar:
 
     threshold = st.slider(
         "Ähnlichkeitsschwelle (%)", 50, 100, 80, 1,
-        help="Paare über diesem Wert werden zur Review vorgeschlagen.\n"
-             "80 % ist ein guter Startwert.",
+        help="Paare über diesem Wert werden zur Review vorgeschlagen.",
     )
 
     analyse_ready = (
@@ -227,21 +218,21 @@ with st.sidebar:
                     threshold,
                     split_dash=cfg["split_dash"],
                 )
-            st.session_state.candidates = cands
-            st.session_state.decisions  = {}
+            st.session_state.candidates     = cands
+            st.session_state.decisions      = {}
+            st.session_state.analysis_count += 1   # Cuvée-Editor zurücksetzen
             if cands:
                 st.success(f"✓ {len(cands)} Kandidatenpaare")
             else:
-                st.info("Keine Paare gefunden.")
+                st.info("Keine Duplikat-Paare gefunden.")
 
-    # Fortschrittsbalken
     if st.session_state.candidates:
         total   = len(st.session_state.candidates)
         decided = len(st.session_state.decisions)
         st.divider()
         st.progress(
             decided / total if total else 0,
-            text=f"Review: {decided} / {total} Paare entschieden",
+            text=f"Duplikate: {decided} / {total} entschieden",
         )
 
 
@@ -254,7 +245,6 @@ if st.session_state.df is None or st.session_state.config is None:
     st.info("👈 Bitte links einen Datentyp wählen, Datei laden und die Analyse starten.")
     st.stop()
 
-# Warnung wenn geladene Datei nicht zum gewählten Typ passt
 if st.session_state.config["label"] != active_config["label"]:
     st.warning(
         f"Aktuell geladen: **{st.session_state.config['label']}**  \n"
@@ -278,10 +268,10 @@ with mc2:
     st.metric(cfg["group_label"] + "gruppen", df[col_group].nunique())
 with mc3:
     n_cand = len(st.session_state.candidates) if st.session_state.candidates is not None else "–"
-    st.metric("Kandidatenpaare", n_cand)
+    st.metric("Duplikat-Kandidaten", n_cand)
 with mc4:
-    confirmed = sum(1 for v in st.session_state.decisions.values() if v != "reject")
-    st.metric("Bestätigte Duplikate", confirmed)
+    n_cuvee = df[col_name].apply(is_cuvee).sum() if cfg["cuvee_detection"] else "–"
+    st.metric("Cuvée-Kandidaten", n_cuvee)
 
 with st.expander(f"Einträge pro {cfg['group_label']} anzeigen"):
     counts = (
@@ -299,95 +289,133 @@ if st.session_state.candidates is None:
 
 candidates = st.session_state.candidates
 
-if not candidates:
-    st.success("✅ Keine Duplikate über dem Schwellwert gefunden.")
-    st.stop()
-
-# ── Review ─────────────────────────────────────────────────────────────────────
+# ── Duplikat-Review ────────────────────────────────────────────────────────────
 
 st.divider()
 st.subheader("📋 Duplikat-Review")
-st.caption(
-    "Für jedes Paar: Wähle, welcher Eintrag das **Original** ist — "
-    "oder verwirf, wenn es kein Duplikat ist."
-)
 
-by_group: dict[str, list] = {}
-for c in candidates:
-    by_group.setdefault(c["group"], []).append(c)
+if not candidates:
+    st.success("✅ Keine Duplikate über dem Schwellwert gefunden.")
+else:
+    st.caption(
+        "Für jedes Paar: Wähle, welcher Eintrag das **Original** ist — "
+        "oder verwirf, wenn es kein Duplikat ist."
+    )
 
-for group_name, pairs in by_group.items():
-    n_open = sum(1 for p in pairs if (p["id_a"], p["id_b"]) not in st.session_state.decisions)
-    with st.expander(
-        f"**{group_name}** — {len(pairs)} Paare  ({n_open} offen)",
-        expanded=n_open > 0,
-    ):
-        for pair in pairs:
-            key      = (pair["id_a"], pair["id_b"])
-            decision = st.session_state.decisions.get(key)
-            score    = pair["score"]
+    by_group: dict[str, list] = {}
+    for c in candidates:
+        by_group.setdefault(c["group"], []).append(c)
 
-            badge  = "🔴" if score >= 95 else ("🟠" if score >= 85 else "🟡")
-            status = {
-                "original_a": "✅ A ist Original",
-                "original_b": "✅ B ist Original",
-                "reject":     "❌ Kein Duplikat",
-            }.get(decision, "⏳ Ausstehend")
+    for group_name, pairs in by_group.items():
+        n_open = sum(1 for p in pairs if (p["id_a"], p["id_b"]) not in st.session_state.decisions)
+        with st.expander(
+            f"**{group_name}** — {len(pairs)} Paare  ({n_open} offen)",
+            expanded=n_open > 0,
+        ):
+            for pair in pairs:
+                key      = (pair["id_a"], pair["id_b"])
+                decision = st.session_state.decisions.get(key)
+                score    = pair["score"]
 
-            st.write(f"{badge} **{score}%** — {status}")
+                badge  = "🔴" if score >= 95 else ("🟠" if score >= 85 else "🟡")
+                status = {
+                    "original_a": "✅ A ist Original",
+                    "original_b": "✅ B ist Original",
+                    "reject":     "❌ Kein Duplikat",
+                }.get(decision, "⏳ Ausstehend")
 
-            left, mid, right = st.columns([4, 4, 3])
+                st.write(f"{badge} **{score}%** — {status}")
 
-            with left:
-                st.markdown("**Eintrag A**")
-                st.markdown(f"```\n{pair['name_a']}\n```")
-                st.caption(f"ID: {pair['id_a']}")
+                left, mid, right = st.columns([4, 4, 3])
+                with left:
+                    st.markdown("**Eintrag A**")
+                    st.markdown(f"```\n{pair['name_a']}\n```")
+                    st.caption(f"ID: {pair['id_a']}")
+                with mid:
+                    st.markdown("**Eintrag B**")
+                    st.markdown(f"```\n{pair['name_b']}\n```")
+                    st.caption(f"ID: {pair['id_b']}")
+                with right:
+                    st.markdown("**Entscheidung**")
+                    b1, b2, b3 = st.columns(3)
+                    uid = f"{key[0][:6]}_{key[1][:6]}"
+                    with b1:
+                        if st.button("A=Orig", key=f"a_{uid}",
+                                     type="primary" if decision == "original_a" else "secondary",
+                                     help="A ist das Original"):
+                            st.session_state.decisions[key] = "original_a"
+                            st.rerun()
+                    with b2:
+                        if st.button("B=Orig", key=f"b_{uid}",
+                                     type="primary" if decision == "original_b" else "secondary",
+                                     help="B ist das Original"):
+                            st.session_state.decisions[key] = "original_b"
+                            st.rerun()
+                    with b3:
+                        if st.button("✗", key=f"r_{uid}",
+                                     type="primary" if decision == "reject" else "secondary",
+                                     help="Kein Duplikat"):
+                            st.session_state.decisions[key] = "reject"
+                            st.rerun()
+                st.divider()
 
-            with mid:
-                st.markdown("**Eintrag B**")
-                st.markdown(f"```\n{pair['name_b']}\n```")
-                st.caption(f"ID: {pair['id_b']}")
 
-            with right:
-                st.markdown("**Entscheidung**")
-                b1, b2, b3 = st.columns(3)
-                uid = f"{key[0][:6]}_{key[1][:6]}"
+# ── Cuvée-Erkennung ────────────────────────────────────────────────────────────
 
-                with b1:
-                    if st.button(
-                        "A=Orig", key=f"a_{uid}",
-                        type="primary" if decision == "original_a" else "secondary",
-                        help="A ist das Original — B wird als Duplikat markiert",
-                    ):
-                        st.session_state.decisions[key] = "original_a"
-                        st.rerun()
+edited_cuvee: pd.DataFrame | None = None
 
-                with b2:
-                    if st.button(
-                        "B=Orig", key=f"b_{uid}",
-                        type="primary" if decision == "original_b" else "secondary",
-                        help="B ist das Original — A wird als Duplikat markiert",
-                    ):
-                        st.session_state.decisions[key] = "original_b"
-                        st.rerun()
+if cfg["cuvee_detection"]:
+    st.divider()
+    st.subheader("🍾 Cuvée-Erkennung")
+    st.caption(
+        "Einträge mit mehreren Rebsorten (kommagetrennt) werden automatisch als "
+        "**Cuvée** erkannt und vorausgewählt. Deaktiviere Einträge, die kein Cuvée sind."
+    )
 
-                with b3:
-                    if st.button(
-                        "✗", key=f"r_{uid}",
-                        type="primary" if decision == "reject" else "secondary",
-                        help="Kein Duplikat — Paar verwerfen",
-                    ):
-                        st.session_state.decisions[key] = "reject"
-                        st.rerun()
+    # Alle Einträge mit Komma im Namen
+    cuvee_mask = df[col_name].apply(is_cuvee)
+    cuvee_rows = df[cuvee_mask].copy()
 
-            st.divider()
+    if cuvee_rows.empty:
+        st.info("Keine Cuvée-Kandidaten erkannt.")
+    else:
+        # Tabelle für den Editor aufbauen
+        cuvee_table = pd.DataFrame({
+            "id":               cuvee_rows[col_id].tolist(),
+            cfg["group_label"]: cuvee_rows[col_group].tolist(),
+            "Rebsorte":         cuvee_rows[col_name].tolist(),
+            "Cuvée":            True,   # alle vorausgewählt
+        })
+
+        edited_cuvee = st.data_editor(
+            cuvee_table,
+            column_config={
+                "id": st.column_config.TextColumn(
+                    "ID", disabled=True, width="small"),
+                cfg["group_label"]: st.column_config.TextColumn(
+                    cfg["group_label"], disabled=True, width="small"),
+                "Rebsorte": st.column_config.TextColumn(
+                    "Rebsorte", disabled=True),
+                "Cuvée": st.column_config.CheckboxColumn(
+                    "Als Cuvée markieren", default=True, width="small"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            # Neuer key bei jedem Analysestart → Editor wird zurückgesetzt
+            key=f"cuvee_editor_{st.session_state.analysis_count}",
+        )
+
+        n_confirmed = int(edited_cuvee["Cuvée"].sum())
+        n_total     = len(cuvee_table)
+        st.caption(f"**{n_confirmed}** von **{n_total}** als Cuvée markiert")
 
 
 # ── Export ─────────────────────────────────────────────────────────────────────
 
-confirmed_pairs = [(k, v) for k, v in st.session_state.decisions.items() if v != "reject"]
+confirmed_pairs  = [(k, v) for k, v in st.session_state.decisions.items() if v != "reject"]
+has_cuvee        = edited_cuvee is not None and bool(edited_cuvee["Cuvée"].any())
 
-if not confirmed_pairs:
+if not confirmed_pairs and not has_cuvee:
     st.stop()
 
 st.divider()
@@ -395,10 +423,15 @@ st.subheader("📥 Export")
 
 out_df = df.copy()
 
-# Spalte 'original_id' direkt nach der ID-Spalte einfügen
+# Spalte 'original_id' nach ID-Spalte einfügen
 insert_pos = list(out_df.columns).index(col_id) + 1
 out_df.insert(insert_pos, "original_id", "")
 
+# Spalte 'is_cuvee' nach 'original_id' einfügen (nur bei Rebsorten)
+if cfg["cuvee_detection"]:
+    out_df.insert(insert_pos + 1, "is_cuvee", "")
+
+# Synonymtabelle aufbauen
 synonyms: list[dict] = []
 
 for (id_a, id_b), decision in confirmed_pairs:
@@ -408,13 +441,11 @@ for (id_a, id_b), decision in confirmed_pairs:
     orig_rows = df[df[col_id] == original_id]
     dup_rows  = df[df[col_id] == duplicate_id]
 
-    orig_name  = orig_rows[col_name].iloc[0]  if not orig_rows.empty else ""
-    dup_name   = dup_rows[col_name].iloc[0]   if not dup_rows.empty  else ""
-    group_val  = orig_rows[col_group].iloc[0] if not orig_rows.empty else ""
+    orig_name = orig_rows[col_name].iloc[0]  if not orig_rows.empty else ""
+    dup_name  = dup_rows[col_name].iloc[0]   if not dup_rows.empty  else ""
+    group_val = orig_rows[col_group].iloc[0] if not orig_rows.empty else ""
 
-    pair  = next(
-        (c for c in candidates if {c["id_a"], c["id_b"]} == {id_a, id_b}), None
-    )
+    pair  = next((c for c in candidates if {c["id_a"], c["id_b"]} == {id_a, id_b}), None)
     score = pair["score"] if pair else 0
 
     out_df.loc[out_df[col_id] == duplicate_id, "original_id"] = original_id
@@ -428,11 +459,43 @@ for (id_a, id_b), decision in confirmed_pairs:
         "confidence_%":   score,
     })
 
+# Cuvée-Spalte befüllen + bestätigte Cuvées in Synonymtabelle
+if cfg["cuvee_detection"] and edited_cuvee is not None:
+    for _, row in edited_cuvee.iterrows():
+        is_confirmed = bool(row["Cuvée"])
+        out_df.loc[out_df[col_id] == row["id"], "is_cuvee"] = "1" if is_confirmed else "0"
+
+        if is_confirmed:
+            # Weintyp für diesen Eintrag ermitteln
+            src_row  = df[df[col_id] == row["id"]]
+            group_val = src_row[col_group].iloc[0] if not src_row.empty else ""
+            synonyms.append({
+                "duplicate_id":   "",           # Cuvées sind keine Duplikate
+                "original_id":    row["id"],
+                "duplicate_name": "",
+                "original_name":  row["Rebsorte"],
+                cfg["group_label"].lower(): group_val,
+                "confidence_%":   100,
+                "type":           "cuvee",
+            })
+
+# Duplikat-Einträge bekommen type-Spalte für Konsistenz
+for s in synonyms:
+    if "type" not in s:
+        s["type"] = "duplicate"
+
 syn_df = pd.DataFrame(synonyms)
 
-st.write(f"**{len(synonyms)} Duplikate** werden exportiert:")
-st.dataframe(syn_df, use_container_width=True, hide_index=True)
+# Vorschau
+if confirmed_pairs:
+    st.write(f"**{len(synonyms)} Duplikate** werden exportiert:")
+    st.dataframe(syn_df, use_container_width=True, hide_index=True)
 
+if has_cuvee:
+    n_cuv = int(edited_cuvee["Cuvée"].sum())
+    st.write(f"**{n_cuv} Cuvées** werden markiert.")
+
+# Download-Buttons
 dcol1, dcol2 = st.columns(2)
 
 with dcol1:
@@ -444,16 +507,24 @@ with dcol1:
         mime="text/csv",
         use_container_width=True,
     )
-    st.caption(f"Gleiche Struktur wie `{os.path.basename(cfg['file'])}` + Spalte `original_id`")
+    extras = []
+    if confirmed_pairs:
+        extras.append("`original_id`")
+    if cfg["cuvee_detection"]:
+        extras.append("`is_cuvee`")
+    st.caption(f"Gleiche Struktur + {' + '.join(extras)}")
 
 with dcol2:
-    syn_name = cfg["out_file"].replace("_cleaned.csv", "_synonyms.csv")
-    syn_out  = syn_df.to_csv(sep=";", index=False).encode("utf-8-sig")
-    st.download_button(
-        "📋 Synonymtabelle herunterladen",
-        data=syn_out,
-        file_name=syn_name,
-        mime="text/csv",
-        use_container_width=True,
-    )
-    st.caption("duplicate_id → original_id Mapping für das Originalsystem")
+    if confirmed_pairs:
+        syn_name = cfg["out_file"].replace("_cleaned.csv", "_synonyms.csv")
+        syn_out  = syn_df.to_csv(sep=";", index=False).encode("utf-8-sig")
+        st.download_button(
+            "📋 Synonymtabelle herunterladen",
+            data=syn_out,
+            file_name=syn_name,
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption("duplicate_id → original_id Mapping für das Originalsystem")
+    else:
+        st.info("Keine Duplikate bestätigt — keine Synonymtabelle.")
