@@ -1,14 +1,7 @@
 """
 WW Duplikat-Erkennung
 Streamlit App zur Erkennung und Bereinigung von Duplikaten in Weindaten.
-Unterstützt: Rebsorten (grapevariety.csv), Weinbauregionen (growingregion.csv)
-
-Ablauf Rebsorten:
-  1. Datei laden  →  Cuvée-Erkennung (sofort, kein Button)
-  2. Cuvée-Review durch User
-  3. Duplikat-Analyse starten  →  läuft nur auf Non-Cuvée-Einträgen
-  4. Duplikat-Review durch User
-  5. Export (CSV + Synonymtabelle)
+Unterstützt: Rebsorten, Weinbauregionen, Winzer
 """
 
 import io
@@ -16,9 +9,11 @@ import os
 import re
 import unicodedata
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz
+from rapidfuzz import process as rfprocess
 
 # ── Datei-Konfigurationen ──────────────────────────────────────────────────────
 
@@ -46,6 +41,17 @@ FILE_CONFIGS = {
         "split_dash":      True,
         "cuvee_detection": False,
         "out_file":        "growingregion_cleaned.csv",
+    },
+    "producer": {
+        "label":           "Winzer",
+        "file":            os.path.join(BASE_DIR, "Datafiles", "producer.csv"),
+        "col_id":          0,      # Id
+        "col_name":        1,      # ShortName
+        "col_group":       None,   # Kein Gruppenfeld — alle vs. alle
+        "group_label":     "Winzer",
+        "split_dash":      False,
+        "cuvee_detection": False,
+        "out_file":        "producer_cleaned.csv",
     },
 }
 
@@ -98,17 +104,28 @@ def load_csv(source) -> tuple[pd.DataFrame | None, str | None]:
 
 
 def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
-                    group_col: str, threshold: int,
+                    group_col: str | None, threshold: int,
                     split_dash: bool = False,
-                    exclude_ids: set | None = None) -> list[dict]:
-    """Findet Duplikat-Paare. exclude_ids werden übersprungen (z.B. bestätigte Cuvées)."""
+                    exclude_ids: set | None = None,
+                    group_none_label: str = "Alle") -> list[dict]:
+    """Findet Duplikat-Paare per rapidfuzz cdist (effizient auch bei >1000 Einträgen).
+
+    group_col=None → alle Einträge werden als eine Gruppe behandelt.
+    exclude_ids    → werden übersprungen (z.B. bestätigte Cuvées).
+    """
     exclude_ids = exclude_ids or set()
     candidates  = []
 
-    for group_name, gdf in df.groupby(group_col):
+    # Gruppen bestimmen
+    if group_col is None:
+        groups = [(group_none_label, df)]
+    else:
+        groups = list(df.groupby(group_col))
+
+    for group_name, gdf in groups:
         valid = gdf[~gdf[name_col].isin(["NULL", "NONE", ""])].copy()
         valid = valid[valid[name_col].notna()]
-        valid = valid[~valid[id_col].isin(exclude_ids)]   # Cuvées raus
+        valid = valid[~valid[id_col].isin(exclude_ids)]
         valid = valid.reset_index(drop=True)
         if len(valid) < 2:
             continue
@@ -117,23 +134,28 @@ def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
         names = valid[name_col].tolist()
         norms = [normalize(n, split_dash=split_dash) for n in names]
 
-        n = len(ids)
-        for i in range(n):
-            if not norms[i]:
-                continue
-            for j in range(i + 1, n):
-                if not norms[j]:
-                    continue
-                score = fuzz.ratio(norms[i], norms[j])
-                if score >= threshold:
-                    candidates.append({
-                        "group":  group_name,
-                        "id_a":   ids[i],
-                        "name_a": names[i],
-                        "id_b":   ids[j],
-                        "name_b": names[j],
-                        "score":  round(score, 1),
-                    })
+        # Leere Normen herausfiltern, Index-Mapping behalten
+        valid_idx   = [i for i, n in enumerate(norms) if n]
+        valid_norms = [norms[i] for i in valid_idx]
+        if len(valid_norms) < 2:
+            continue
+
+        # Paarweise Ähnlichkeit per cdist (C-Implementierung, deutlich schneller als Python-Loop)
+        matrix = rfprocess.cdist(valid_norms, valid_norms,
+                                 scorer=fuzz.ratio, score_cutoff=threshold)
+
+        rows, cols = np.where(np.triu(matrix, k=1) > 0)
+        for r, c in zip(rows.tolist(), cols.tolist()):
+            orig_r = valid_idx[r]
+            orig_c = valid_idx[c]
+            candidates.append({
+                "group":  group_name,
+                "id_a":   ids[orig_r],
+                "name_a": names[orig_r],
+                "id_b":   ids[orig_c],
+                "name_b": names[orig_c],
+                "score":  round(float(matrix[r, c]), 1),
+            })
 
     return sorted(candidates, key=lambda x: (-x["score"], x["group"], x["name_a"]))
 
@@ -194,9 +216,12 @@ with st.sidebar:
                 st.session_state.df                  = df_new
                 st.session_state.encoding            = enc
                 st.session_state.config              = active_config
-                st.session_state.col_id              = df_new.columns[active_config["col_id"]]
-                st.session_state.col_name            = df_new.columns[active_config["col_name"]]
-                st.session_state.col_group           = df_new.columns[active_config["col_group"]]
+                st.session_state.col_id    = df_new.columns[active_config["col_id"]]
+                st.session_state.col_name  = df_new.columns[active_config["col_name"]]
+                col_group_idx              = active_config["col_group"]
+                st.session_state.col_group = (
+                    df_new.columns[col_group_idx] if col_group_idx is not None else None
+                )
                 st.session_state.candidates          = None
                 st.session_state.decisions           = {}
                 st.session_state.confirmed_cuvee_ids = set()
@@ -237,8 +262,8 @@ with st.sidebar:
                     st.session_state.col_group,
                     threshold,
                     split_dash=cfg["split_dash"],
-                    # Bestätigte Cuvées aus der Duplikat-Analyse ausschließen
                     exclude_ids=st.session_state.confirmed_cuvee_ids,
+                    group_none_label=cfg["label"],
                 )
             st.session_state.candidates  = cands
             st.session_state.decisions   = {}
@@ -287,7 +312,10 @@ mc1, mc2, mc3, mc4 = st.columns(4)
 with mc1:
     st.metric("Einträge gesamt", len(df))
 with mc2:
-    st.metric(cfg["group_label"] + "gruppen", df[col_group].nunique())
+    if col_group is not None:
+        st.metric(cfg["group_label"] + "gruppen", df[col_group].nunique())
+    else:
+        st.metric("Einträge", len(df))
 with mc3:
     n_cuvee = int(df[col_name].apply(is_cuvee).sum()) if cfg["cuvee_detection"] else "–"
     st.metric("Cuvée-Kandidaten", n_cuvee)
@@ -295,15 +323,16 @@ with mc4:
     n_cand = len(st.session_state.candidates) if st.session_state.candidates is not None else "–"
     st.metric("Duplikat-Kandidaten", n_cand)
 
-with st.expander(f"Einträge pro {cfg['group_label']} anzeigen"):
-    counts = (
-        df.groupby(col_group)[col_id]
-        .count()
-        .reset_index()
-        .rename(columns={col_group: cfg["group_label"], col_id: cfg["label"]})
-        .sort_values(cfg["label"], ascending=False)
-    )
-    st.dataframe(counts, use_container_width=True, hide_index=True)
+if col_group is not None:
+    with st.expander(f"Einträge pro {cfg['group_label']} anzeigen"):
+        counts = (
+            df.groupby(col_group)[col_id]
+            .count()
+            .reset_index()
+            .rename(columns={col_group: cfg["group_label"], col_id: cfg["label"]})
+            .sort_values(cfg["label"], ascending=False)
+        )
+        st.dataframe(counts, use_container_width=True, hide_index=True)
 
 
 # ── SCHRITT 1: Cuvée-Erkennung ─────────────────────────────────────────────────
@@ -477,7 +506,7 @@ for (id_a, id_b), decision in confirmed_pairs:
 
     orig_name = orig_rows[col_name].iloc[0]  if not orig_rows.empty else ""
     dup_name  = dup_rows[col_name].iloc[0]   if not dup_rows.empty  else ""
-    group_val = orig_rows[col_group].iloc[0] if not orig_rows.empty else ""
+    group_val = (orig_rows[col_group].iloc[0] if (col_group and not orig_rows.empty) else "")
 
     pair  = next((c for c in candidates if {c["id_a"], c["id_b"]} == {id_a, id_b}), None)
     score = pair["score"] if pair else 0
