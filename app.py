@@ -460,6 +460,24 @@ else:
             f"**{group_name}** — {len(pairs)} Paare  ({n_open} offen)",
             expanded=n_open > 0,
         ):
+            # Wein-Kontext: gemeinsame Attribute einmalig pro Gruppe anzeigen
+            if cfg.get("composite_group") and pairs:
+                ctx = df[df[col_id] == pairs[0]["id_a"]]
+                if not ctx.empty:
+                    r      = ctx.iloc[0]
+                    c_prod  = df.columns[cfg["col_producer_name"]]
+                    c_type  = df.columns[cfg["col_wine_type_name"]]
+                    c_year  = df.columns[cfg["col_year"]]
+                    c_wtype = df.columns[cfg["col_wine_type_id"]]
+                    c_btl   = df.columns[cfg["col_bottle"]]
+                    st.info(
+                        f"**Winzer:** {r[c_prod]}  ·  "
+                        f"**Jahrgang:** {r[c_year]}  ·  "
+                        f"**Rebsorte:** {r[c_type]}  ·  "
+                        f"**Weinsorte-ID:** `{str(r[c_wtype])[:8]}…`  ·  "
+                        f"**Flaschen-ID:** `{str(r[c_btl])[:8]}…`"
+                    )
+
             for pair in pairs:
                 key      = (pair["id_a"], pair["id_b"])
                 decision = st.session_state.decisions.get(key)
