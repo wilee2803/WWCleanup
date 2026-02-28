@@ -1,5 +1,8 @@
 # Echte Daten – nicht ins Repository
-Datafiles/
+Datafiles/product.csv
+Datafiles/producer.csv
+Datafiles/grapevariety.csv
+Datafiles/growingregion.csv
 
 # Python
 __pycache__/
