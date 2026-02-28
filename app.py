@@ -125,6 +125,33 @@ def load_csv(source) -> tuple[pd.DataFrame | None, str | None]:
     return None, None
 
 
+@st.cache_data
+def load_bottle_mapping() -> dict:
+    """Lädt packingunittype.csv und gibt ein Dict {UUID: lesbarer Name} zurück."""
+    path = os.path.join(BASE_DIR, "Datafiles", "packingunittype.csv")
+    if not os.path.exists(path):
+        return {}
+    try:
+        df_btl = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
+        return dict(zip(df_btl["Id"].str.strip(), df_btl["Title"].str.strip()))
+    except Exception:
+        return {}
+
+
+@st.cache_data
+def load_wine_type_mapping() -> dict:
+    """Lädt grapevarietygroup.csv und gibt ein Dict {UUID: lesbarer Name} zurück."""
+    path = os.path.join(BASE_DIR, "Datafiles", "grapevarietygroup.csv")
+    if not os.path.exists(path):
+        return {}
+    try:
+        df_wt = pd.read_csv(path, sep=";", encoding="latin-1", dtype=str,
+                            keep_default_na=False)
+        return dict(zip(df_wt["Id"].str.strip(), df_wt["Title"].str.strip()))
+    except Exception:
+        return {}
+
+
 def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
                     group_col: str | None, threshold: int,
                     split_dash: bool = False,
@@ -247,12 +274,13 @@ with st.sidebar:
                     c_year  = df_new.columns[active_config["col_year"]]
                     c_grape = df_new.columns[active_config["col_grape_id"]]
                     c_btl   = df_new.columns[active_config["col_bottle"]]
+                    btl_map = load_bottle_mapping()
                     df_new["_group"] = (
                         df_new[c_prod].str.strip() + " / " +
                         df_new[c_type].str.strip() + " / " +
                         df_new[c_year].str.strip() + " / " +
                         df_new[c_grape].str[:8] + " / " +
-                        df_new[c_btl].str[:8]
+                        df_new[c_btl].map(lambda x: btl_map.get(x, x[:8]))
                     )
                     st.session_state.col_group = "_group"
                 else:
@@ -470,12 +498,16 @@ else:
                     c_year  = df.columns[cfg["col_year"]]
                     c_wtype = df.columns[cfg["col_wine_type_id"]]
                     c_btl   = df.columns[cfg["col_bottle"]]
+                    btl_map  = load_bottle_mapping()
+                    wt_map   = load_wine_type_mapping()
+                    btl_label = btl_map.get(str(r[c_btl]),  str(r[c_btl])[:8]  + "…")
+                    wt_label  = wt_map.get(str(r[c_wtype]), str(r[c_wtype])[:8] + "…")
                     st.info(
                         f"**Winzer:** {r[c_prod]}  ·  "
                         f"**Jahrgang:** {r[c_year]}  ·  "
                         f"**Rebsorte:** {r[c_type]}  ·  "
-                        f"**Weinsorte-ID:** `{str(r[c_wtype])[:8]}…`  ·  "
-                        f"**Flaschen-ID:** `{str(r[c_btl])[:8]}…`"
+                        f"**Weinsorte:** {wt_label}  ·  "
+                        f"**Flaschengröße:** {btl_label}"
                     )
 
             for pair in pairs:
