@@ -125,31 +125,51 @@ def load_csv(source) -> tuple[pd.DataFrame | None, str | None]:
     return None, None
 
 
-@st.cache_data
 def load_bottle_mapping() -> dict:
-    """Lädt packingunittype.csv und gibt ein Dict {UUID: lesbarer Name} zurück."""
+    """Gibt ein Dict {UUID: lesbarer Name} für Flaschengrößen zurück.
+    Primär: packingunittype.csv; Fallback: hardcodierte Werte."""
     path = os.path.join(BASE_DIR, "Datafiles", "packingunittype.csv")
+    _fallback = {
+        "fe76ab14-c231-e95e-b5d4-3a13412f9a95": ".750L",
+        "ce66ab14-c231-e95e-b5d4-3a13412f9a95": ".5L",
+        "fe76ab14-c231-e95e-b5d4-3a13412f9b95": ".375L",
+        "15e816fd-770c-9570-0ef6-3a13412f9841": "1L",
+        "546d4174-f673-63ed-58c1-3a13412f9841": "1.5L",
+        "2e76ab14-c231-e95e-b5d4-3a13412f9b95": "2L",
+        "a5e816fd-770c-9570-0ef6-3a13412f9841": "3L",
+        "55e816fd-770c-9570-0ef6-3a13412f9841": "5L",
+        "65e816fd-770c-9570-0ef6-3a13412f9841": "6L",
+        "be76ab14-c231-e95e-b5d4-3a13412f9b95": "12L",
+    }
     if not os.path.exists(path):
-        return {}
+        return _fallback
     try:
         df_btl = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
         return dict(zip(df_btl["Id"].str.strip(), df_btl["Title"].str.strip()))
     except Exception:
-        return {}
+        return _fallback
 
 
-@st.cache_data
 def load_wine_type_mapping() -> dict:
-    """Lädt grapevarietygroup.csv und gibt ein Dict {UUID: lesbarer Name} zurück."""
+    """Gibt ein Dict {UUID: lesbarer Name} für Weinsorten zurück.
+    Primär: grapevarietygroup.csv; Fallback: hardcodierte Werte."""
     path = os.path.join(BASE_DIR, "Datafiles", "grapevarietygroup.csv")
+    _fallback = {
+        "1058504d-c1b3-416f-d533-3a133d623252": "Red Wine",
+        "1158504d-c1b3-416f-d533-3a133d623252": "Rosé Wine",
+        "1258504d-c1b3-416f-d533-3a133d623252": "Sparkling Wine",
+        "1358504d-c1b3-416f-d533-3a133d623252": "Sweet & Dessert Wine",
+        "1458504d-c1b3-416f-d533-3a133d623252": "White Wine",
+        "1558504d-c1b3-416f-d533-3a133d623252": "Others",
+    }
     if not os.path.exists(path):
-        return {}
+        return _fallback
     try:
         df_wt = pd.read_csv(path, sep=";", encoding="latin-1", dtype=str,
                             keep_default_na=False)
         return dict(zip(df_wt["Id"].str.strip(), df_wt["Title"].str.strip()))
     except Exception:
-        return {}
+        return _fallback
 
 
 def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
