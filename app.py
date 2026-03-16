@@ -111,8 +111,10 @@ def is_cuvee(name: str) -> bool:
 
 
 def is_cuvee_master_name(name: str) -> bool:
-    """True wenn der Name normalisiert exakt 'cuvee' ist (z.B. 'Cuvée', 'Cuvee')."""
-    return normalize(name) == "cuvee"
+    """True wenn der Name mit 'cuvee' beginnt und kein Blend ist (kein Komma).
+    Erfasst z.B. 'Cuvée', 'Cuvée Weiss', 'Cuvee Rouge' — aber nicht 'Cuvée, Merlot'."""
+    n = normalize(name)
+    return n.startswith("cuvee") and "," not in n
 
 
 def load_csv(source) -> tuple[pd.DataFrame | None, str | None]:
