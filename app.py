@@ -110,6 +110,11 @@ def is_cuvee(name: str) -> bool:
     return "," in str(name)
 
 
+def is_cuvee_master_name(name: str) -> bool:
+    """True wenn der Name normalisiert exakt 'cuvee' ist (z.B. 'Cuvée', 'Cuvee')."""
+    return normalize(name) == "cuvee"
+
+
 def load_csv(source) -> tuple[pd.DataFrame | None, str | None]:
     for enc in ("latin-1", "cp1252", "utf-8", "utf-8-sig"):
         try:
@@ -232,17 +237,19 @@ def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
 # ── Session State Init ─────────────────────────────────────────────────────────
 
 _defaults: dict = {
-    "df":                  None,
-    "encoding":            None,
-    "config":              None,
-    "candidates":          None,
-    "decisions":           {},
-    "col_id":              None,
-    "col_name":            None,
-    "col_group":           None,
-    "file_load_count":     0,    # erhöht bei Datei-Load → setzt Cuvée-Editor zurück
-    "analysis_count":      0,    # erhöht bei Analyse-Start
-    "confirmed_cuvee_ids": set(), # IDs bestätigter Cuvées (aus letztem Render)
+    "df":                          None,
+    "encoding":                    None,
+    "config":                      None,
+    "candidates":                  None,
+    "decisions":                   {},
+    "col_id":                      None,
+    "col_name":                    None,
+    "col_group":                   None,
+    "file_load_count":             0,    # erhöht bei Datei-Load → setzt Editoren zurück
+    "analysis_count":              0,    # erhöht bei Analyse-Start
+    "confirmed_cuvee_ids":         set(), # IDs bestätigter Blend-Cuvées (Schritt 2)
+    "cuvee_master_per_group":      {},   # {group_val: master_id} aus Schritt 1
+    "cuvee_master_non_master_ids": set(), # nicht-Master-Cuvée-IDs aus Schritt 1
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -309,11 +316,13 @@ with st.sidebar:
                         df_new.columns[col_group_idx] if col_group_idx is not None else None
                     )
 
-                st.session_state.df                  = df_new
-                st.session_state.candidates          = None
-                st.session_state.decisions           = {}
-                st.session_state.confirmed_cuvee_ids = set()
-                st.session_state.file_load_count    += 1
+                st.session_state.df                          = df_new
+                st.session_state.candidates                  = None
+                st.session_state.decisions                   = {}
+                st.session_state.confirmed_cuvee_ids         = set()
+                st.session_state.cuvee_master_per_group      = {}
+                st.session_state.cuvee_master_non_master_ids = set()
+                st.session_state.file_load_count            += 1
                 st.success(f"✓ {len(df_new)} Zeilen geladen  \nKodierung: {enc}")
             else:
                 st.error("Datei konnte nicht gelesen werden.")
@@ -324,7 +333,7 @@ with st.sidebar:
 
     threshold = st.slider(
         "Ähnlichkeitsschwelle (%)", 50, 100, 80, 1,
-        help="Gilt für Schritt 2: Duplikat-Erkennung.",
+        help="Gilt für Schritt 3: Duplikat-Erkennung.",
     )
 
     analyse_ready = (
@@ -334,15 +343,26 @@ with st.sidebar:
     )
 
     if analyse_ready:
-        # Hinweis bei Rebsorten, dass Cuvée-Review zuerst kommen sollte
         if active_config["cuvee_detection"]:
-            n_cuvee_confirmed = len(st.session_state.confirmed_cuvee_ids)
-            st.caption(f"Schritt 1 abgeschlossen: **{n_cuvee_confirmed}** Cuvées markiert")
+            n_master  = len(st.session_state.cuvee_master_per_group)
+            n_non_master = len(st.session_state.cuvee_master_non_master_ids)
+            n_blends  = len(st.session_state.confirmed_cuvee_ids)
+            st.caption(
+                f"Schritt 1: **{n_master}** Cuvée-Master  \n"
+                f"Schritt 2: **{n_blends}** Blend-Cuvées markiert"
+            )
+            if n_non_master:
+                st.caption(f"↳ {n_non_master} doppelte Cuvée-Einträge entfernt")
 
         if st.button("🔍 Duplikat-Analyse starten", type="primary",
                      use_container_width=True):
             cfg = st.session_state.config
             with st.spinner("Suche Duplikate..."):
+                # Aus Analyse ausschließen: bestätigte Blend-Cuvées + nicht-Master-Einträge
+                exclude = (
+                    st.session_state.confirmed_cuvee_ids |
+                    st.session_state.cuvee_master_non_master_ids
+                )
                 cands = find_candidates(
                     st.session_state.df,
                     st.session_state.col_id,
@@ -350,7 +370,7 @@ with st.sidebar:
                     st.session_state.col_group,
                     threshold,
                     split_dash=cfg["split_dash"],
-                    exclude_ids=st.session_state.confirmed_cuvee_ids,
+                    exclude_ids=exclude,
                     group_none_label=cfg["label"],
                 )
             st.session_state.candidates  = cands
@@ -424,24 +444,100 @@ if col_group is not None:
         st.dataframe(counts, use_container_width=True, hide_index=True)
 
 
-# ── SCHRITT 1: Cuvée-Erkennung ─────────────────────────────────────────────────
+# ── SCHRITT 1: Cuvée-Master je Weintyp ─────────────────────────────────────────
+
+if cfg["cuvee_detection"]:
+    st.divider()
+    st.subheader("Schritt 1 — 🏆 Cuvée-Master je Weintyp")
+    st.caption(
+        "Pro Weintyp wird genau ein 'Cuvée'-Eintrag als Master bestimmt. "
+        "Gibt es mehrere, wähle den Master — die übrigen werden als Duplikate behandelt."
+    )
+
+    master_mask = df[col_name].apply(is_cuvee_master_name)
+    master_rows = df[master_mask].copy()
+
+    if master_rows.empty:
+        st.warning("⚠️ Keine Einträge mit Name 'Cuvée' gefunden. Bitte prüfe die Daten.")
+        master_per_group      = {}
+        non_master_ids        = set()
+    else:
+        master_per_group = {}
+        non_master_ids   = set()
+        needs_manual     = []
+
+        for group_val, gdf in master_rows.groupby(col_group):
+            entries = gdf[[col_id, col_name]].reset_index(drop=True)
+            if len(entries) == 1:
+                master_per_group[group_val] = entries[col_id].iloc[0]
+            else:
+                needs_manual.append((group_val, entries))
+
+        if needs_manual:
+            st.info(
+                f"Bei **{len(needs_manual)}** Weintypen gibt es mehrere 'Cuvée'-Einträge — "
+                "bitte jeweils den Master auswählen:"
+            )
+            for group_val, entries in needs_manual:
+                st.write(f"**{group_val}**")
+                options = {
+                    f"{row[col_name]}  (ID: {row[col_id][:8]}…)": row[col_id]
+                    for _, row in entries.iterrows()
+                }
+                safe_key = re.sub(r"[^a-zA-Z0-9_]", "_", str(group_val))
+                selected_label = st.radio(
+                    f"Master für {group_val}",
+                    options=list(options.keys()),
+                    key=f"cuvee_master_{safe_key}_{st.session_state.file_load_count}",
+                    label_visibility="collapsed",
+                )
+                master_per_group[group_val] = options[selected_label]
+
+        # Nicht-Master-IDs bestimmen
+        for group_val, gdf in master_rows.groupby(col_group):
+            master_id = master_per_group.get(group_val)
+            for _, row in gdf.iterrows():
+                if row[col_id] != master_id:
+                    non_master_ids.add(row[col_id])
+
+        n_auto   = sum(1 for _, gdf in master_rows.groupby(col_group) if len(gdf) == 1)
+        n_manual = len(needs_manual)
+        total_groups = n_auto + n_manual
+
+        if non_master_ids:
+            st.warning(
+                f"**{len(non_master_ids)}** doppelte Cuvée-Einträge werden in der "
+                "Synonymtabelle als Duplikate geführt."
+            )
+        else:
+            st.success(
+                f"✅ {total_groups} Weintypen — je genau ein Cuvée-Master vorhanden."
+            )
+
+    # Immer in Session State schreiben (auch wenn leer)
+    st.session_state.cuvee_master_per_group      = master_per_group
+    st.session_state.cuvee_master_non_master_ids = non_master_ids
+
+
+# ── SCHRITT 2: Cuvée-Erkennung (Blends) ────────────────────────────────────────
 
 edited_cuvee: pd.DataFrame | None = None
 
 if cfg["cuvee_detection"]:
     st.divider()
-    st.subheader("Schritt 1 — 🍾 Cuvée-Erkennung")
+    st.subheader("Schritt 2 — 🍾 Cuvée-Erkennung")
     st.caption(
         "Einträge mit mehreren Rebsorten (kommagetrennt) sind als Cuvée vorausgewählt. "
         "Deaktiviere Einträge, die kein Cuvée sind. "
-        "Bestätigte Cuvées werden aus der Duplikat-Analyse ausgeschlossen."
+        "Bestätigte Cuvées werden auf den jeweiligen Cuvée-Master (Schritt 1) gemappt "
+        "und aus der Duplikat-Analyse ausgeschlossen."
     )
 
     cuvee_mask = df[col_name].apply(is_cuvee)
     cuvee_rows = df[cuvee_mask].copy()
 
     if cuvee_rows.empty:
-        st.info("Keine Cuvée-Kandidaten erkannt.")
+        st.info("Keine Blend-Cuvée-Kandidaten erkannt.")
     else:
         cuvee_table = pd.DataFrame({
             "id":               cuvee_rows[col_id].tolist(),
@@ -449,6 +545,12 @@ if cfg["cuvee_detection"]:
             "Rebsorte":         cuvee_rows[col_name].tolist(),
             "Cuvée":            True,
         })
+
+        # Master-ID pro Gruppe für Vorschau anzeigen
+        master_map = st.session_state.cuvee_master_per_group
+        cuvee_table["Master-ID"] = cuvee_table[cfg["group_label"]].map(
+            lambda g: master_map.get(g, "⚠️ kein Master")
+        )
 
         edited_cuvee = st.data_editor(
             cuvee_table,
@@ -461,6 +563,8 @@ if cfg["cuvee_detection"]:
                     "Rebsorte", disabled=True),
                 "Cuvée": st.column_config.CheckboxColumn(
                     "Als Cuvée markieren", default=True, width="small"),
+                "Master-ID": st.column_config.TextColumn(
+                    "→ Cuvée-Master", disabled=True, width="medium"),
             },
             hide_index=True,
             use_container_width=True,
@@ -472,16 +576,15 @@ if cfg["cuvee_detection"]:
         st.caption(f"**{n_confirmed}** von **{n_total}** als Cuvée markiert — "
                    f"danach links auf **Duplikat-Analyse starten** klicken")
 
-        # Bestätigte IDs in Session State speichern (für Analyse-Button im nächsten Render)
         st.session_state.confirmed_cuvee_ids = set(
             edited_cuvee[edited_cuvee["Cuvée"]]["id"].tolist()
         )
 
 
-# ── SCHRITT 2: Duplikat-Review ─────────────────────────────────────────────────
+# ── SCHRITT 3: Duplikat-Review ─────────────────────────────────────────────────
 
 st.divider()
-st.subheader("Schritt 2 — 📋 Duplikat-Review")
+st.subheader("Schritt 3 — 📋 Duplikat-Review")
 
 if st.session_state.candidates is None:
     st.info("👈 Klicke auf **Duplikat-Analyse starten** um fortzufahren.")
@@ -582,6 +685,7 @@ else:
 
 confirmed_pairs   = [(k, v) for k, v in st.session_state.decisions.items() if v != "reject"]
 has_cuvee         = (edited_cuvee is not None and bool(edited_cuvee["Cuvée"].any()))
+has_non_masters   = bool(st.session_state.cuvee_master_non_master_ids)
 all_pairs_decided = (len(st.session_state.decisions) == len(candidates))
 
 # Export erst anzeigen wenn alle Paare entschieden wurden
@@ -590,7 +694,7 @@ if not all_pairs_decided:
     st.info(f"⏳ Noch **{remaining}** Paare offen — bitte alle entscheiden, dann erscheint der Export.")
     st.stop()
 
-if not confirmed_pairs and not has_cuvee:
+if not confirmed_pairs and not has_cuvee and not has_non_masters:
     st.stop()
 
 st.divider()
@@ -612,7 +716,33 @@ if cfg["cuvee_detection"]:
 # Synonymtabelle
 synonyms: list[dict] = []
 
-# 1) Bestätigte Duplikate
+# 0) Schritt 1: doppelte Cuvée-Einträge (nicht-Master → Master)
+if cfg["cuvee_detection"] and has_non_masters:
+    master_map = st.session_state.cuvee_master_per_group
+    for non_master_id in st.session_state.cuvee_master_non_master_ids:
+        nm_rows = df[df[col_id] == non_master_id]
+        if nm_rows.empty:
+            continue
+        nm_row    = nm_rows.iloc[0]
+        group_val = nm_row[col_group]
+        master_id = master_map.get(group_val, "")
+        master_rows_df = df[df[col_id] == master_id]
+        master_name = master_rows_df[col_name].iloc[0] if not master_rows_df.empty else ""
+
+        out_df.loc[out_df[col_id] == non_master_id, "original_id"] = master_id
+        out_df.loc[out_df[col_id] == non_master_id, "is_cuvee"]    = "1"
+
+        synonyms.append({
+            "type":           "duplicate",
+            "duplicate_id":   non_master_id,
+            "original_id":    master_id,
+            "duplicate_name": nm_row[col_name],
+            "original_name":  master_name,
+            cfg["group_label"].lower(): group_val,
+            "confidence_%":   100,
+        })
+
+# 1) Schritt 3: bestätigte Duplikate
 for (id_a, id_b), decision in confirmed_pairs:
     original_id  = id_a if decision == "original_a" else id_b
     duplicate_id = id_b if decision == "original_a" else id_a
@@ -639,42 +769,62 @@ for (id_a, id_b), decision in confirmed_pairs:
         "confidence_%":   score,
     })
 
-# 2) Bestätigte Cuvées
+# 2) Schritt 2: bestätigte Blend-Cuvées → auf Master mappen
 if cfg["cuvee_detection"] and edited_cuvee is not None:
+    master_map = st.session_state.cuvee_master_per_group
     for _, row in edited_cuvee.iterrows():
         is_confirmed = bool(row["Cuvée"])
-        out_df.loc[out_df[col_id] == row["id"], "is_cuvee"] = "1" if is_confirmed else "0"
+        blend_id     = row["id"]
+        group_val    = row[cfg["group_label"]]
+        master_id    = master_map.get(group_val, "")
+
+        out_df.loc[out_df[col_id] == blend_id, "is_cuvee"] = "1" if is_confirmed else "0"
 
         if is_confirmed:
-            src_row   = df[df[col_id] == row["id"]]
-            group_val = src_row[col_group].iloc[0] if not src_row.empty else ""
+            if master_id:
+                out_df.loc[out_df[col_id] == blend_id, "original_id"] = master_id
+            master_rows_df = df[df[col_id] == master_id] if master_id else pd.DataFrame()
+            master_name = master_rows_df[col_name].iloc[0] if not master_rows_df.empty else ""
+
             synonyms.append({
                 "type":           "cuvee",
-                "duplicate_id":   "",
-                "original_id":    row["id"],
-                "duplicate_name": "",
-                "original_name":  row["Rebsorte"],
+                "duplicate_id":   blend_id,
+                "original_id":    master_id,
+                "duplicate_name": row["Rebsorte"],
+                "original_name":  master_name,
                 cfg["group_label"].lower(): group_val,
                 "confidence_%":   100,
             })
+
+# Master-Cuvée-Einträge selbst als is_cuvee=1 markieren
+if cfg["cuvee_detection"]:
+    for master_id in st.session_state.cuvee_master_per_group.values():
+        out_df.loc[out_df[col_id] == master_id, "is_cuvee"] = "1"
 
 syn_df = pd.DataFrame(synonyms)
 
 # Vorschau
 if confirmed_pairs:
     n_dup = len(confirmed_pairs)
-    st.write(f"**{n_dup} Duplikate** bestätigt:")
+    st.write(f"**{n_dup} Duplikate** bestätigt (Schritt 3):")
     st.dataframe(
         syn_df[syn_df["type"] == "duplicate"].drop(columns="type"),
         use_container_width=True, hide_index=True,
     )
 
-if has_cuvee:
-    n_cuv = int(edited_cuvee["Cuvée"].sum())
-    st.write(f"**{n_cuv} Cuvées** markiert:")
+if has_cuvee or has_non_masters:
+    n_cuv      = int(edited_cuvee["Cuvée"].sum()) if edited_cuvee is not None else 0
+    n_nm       = len(st.session_state.cuvee_master_non_master_ids)
+    parts      = []
+    if n_nm:
+        parts.append(f"**{n_nm}** doppelte Cuvée-Einträge (Schritt 1)")
+    if n_cuv:
+        parts.append(f"**{n_cuv}** Blend-Cuvées (Schritt 2)")
+    st.write(f"{' + '.join(parts)}:")
     st.dataframe(
         syn_df[syn_df["type"] == "cuvee"][
-            ["original_id", "original_name", cfg["group_label"].lower()]
+            ["duplicate_id", "original_id", "duplicate_name", "original_name",
+             cfg["group_label"].lower()]
         ],
         use_container_width=True, hide_index=True,
     )
@@ -706,4 +856,7 @@ with dcol2:
         mime="text/csv",
         use_container_width=True,
     )
-    st.caption("Enthält Duplikate (type=duplicate) und Cuvées (type=cuvee)")
+    st.caption(
+        "type=duplicate: Duplikate (Schritt 1+3)  |  "
+        "type=cuvee: Blend-Cuvées → Master (Schritt 2)"
+    )
