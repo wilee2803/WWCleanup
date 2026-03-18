@@ -8,6 +8,7 @@ import io
 import os
 import re
 import unicodedata
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -194,25 +195,31 @@ def load_known_synonyms(
     col_name: str,
     col_group: str | None,
     split_dash: bool = True,
-) -> tuple[list[dict], set, list[str], list[tuple[str, str]]]:
+) -> tuple[list[dict], set, list[str], list[tuple[str, str]], list[dict]]:
     """Lädt vorab bekannte Synonyme aus einer Excel-Datei (Dupletten_Weinbauregion.xlsx).
 
     Struktur: Spalten 'Land', 'Weinbauregion' (Master), 'Duplikate'.
     Weinbauregion wird vorwärts gefüllt; eine neue Master-Zeile erkennt man daran,
     dass Weinbauregion in der Originaldatei befüllt ist.
 
+    Für ungematchte Master (kein Eintrag in der CSV):
+    - Wird eine deterministische UUID generiert
+    - Synonym-Paare werden trotzdem erstellt
+    - Ein neuer DB-Eintrag wird in new_records zurückgegeben
+
     Gibt zurück:
         synonyms          – Liste von Synonym-Dicts (direkt in den Export-Pool)
         duplicate_ids     – Set der Duplikat-IDs (werden aus Fuzzy-Matching ausgeschlossen)
-        unmatched_masters – Masternamen ohne Treffer in der CSV
+        unmatched_masters – Masternamen ohne Treffer in der CSV (aber mit neuer UUID)
         unmatched_dupes   – (master_name, dup_name)-Paare ohne Treffer in der CSV
+        new_records       – Neue DB-Einträge (im Format der growingregion.csv)
     """
     if not os.path.exists(xlsx_path):
-        return [], set(), [], []
+        return [], set(), [], [], []
     try:
         xl = pd.read_excel(xlsx_path)
     except Exception:
-        return [], set(), [], []
+        return [], set(), [], [], []
 
     # Lookup: normalisierter Name → (id, group_value)
     name_to_row: dict[str, tuple[str, str]] = {}
@@ -222,19 +229,36 @@ def load_known_synonyms(
             grp = str(row[col_group]) if col_group else ""
             name_to_row[norm] = (str(row[col_id]), grp)
 
+    # IsoAlp2 → CountryId Lookup aus bestehenden Einträgen
+    iso_to_country: dict[str, str] = {}
+    if col_group:
+        col_country_candidates = [c for c in df.columns if "country" in c.lower()]
+        if col_country_candidates:
+            col_ctry = col_country_candidates[0]
+            iso_to_country = (
+                df[df[col_ctry].str.strip() != ""]
+                .groupby(col_group)[col_ctry]
+                .first()
+                .to_dict()
+            )
+
     xl = xl.copy()
     xl["_is_master"] = xl["Weinbauregion"].notna()
     xl["Weinbauregion"] = xl["Weinbauregion"].ffill()
 
-    synonyms:          list[dict]         = []
-    duplicate_ids:     set                = set()
-    unmatched_masters: list[str]          = []
-    unmatched_dupes:   list[tuple[str, str]] = []
-    seen_pairs:        set                = set()
+    synonyms:          list[dict]             = []
+    duplicate_ids:     set                    = set()
+    unmatched_masters: list[str]              = []
+    unmatched_dupes:   list[tuple[str, str]]  = []
+    seen_pairs:        set                    = set()
 
     current_master:    str | None = None
     current_master_id: str | None = None
     current_group:     str        = ""
+    current_is_new:    bool       = False
+
+    # Puffer für ungematchte Master: name → [(dup_name, dup_id, dup_grp)]
+    pending_new: dict[str, list[tuple[str, str, str]]] = {}
 
     for _, row in xl.iterrows():
         wb  = str(row.get("Weinbauregion", "")).strip()
@@ -243,14 +267,17 @@ def load_known_synonyms(
 
         # Neue Master-Zeile
         if row["_is_master"] and wb and wb != "nan":
-            current_master = wb
-            norm_master    = normalize(wb, split_dash=split_dash)
+            current_master  = wb
+            norm_master     = normalize(wb, split_dash=split_dash)
             if norm_master in name_to_row:
                 current_master_id, current_group = name_to_row[norm_master]
+                current_is_new = False
             else:
                 current_master_id = None
                 current_group     = ""
-                if wb not in unmatched_masters:
+                current_is_new    = True
+                if wb not in pending_new:
+                    pending_new[wb] = []
                     unmatched_masters.append(wb)
 
         # Duplikat verarbeiten
@@ -258,27 +285,80 @@ def load_known_synonyms(
             norm_dup = normalize(dup, split_dash=split_dash)
             if norm_dup in name_to_row:
                 dup_id, dup_grp = name_to_row[norm_dup]
-                pair_key = (current_master_id, dup_id)
-                if (
-                    current_master_id
-                    and dup_id != current_master_id
-                    and pair_key not in seen_pairs
-                ):
-                    seen_pairs.add(pair_key)
-                    duplicate_ids.add(dup_id)
-                    synonyms.append({
-                        "type":           "duplicate",
-                        "duplicate_id":   dup_id,
-                        "original_id":    current_master_id,
-                        "duplicate_name": dup,
-                        "original_name":  current_master,
-                        "land":           dup_grp or current_group,
-                        "confidence_%":   100,
-                    })
+                if current_is_new:
+                    # Duplikat für neuen Master puffern
+                    pending_new.setdefault(current_master, []).append(
+                        (dup, dup_id, dup_grp)
+                    )
+                else:
+                    pair_key = (current_master_id, dup_id)
+                    if (
+                        current_master_id
+                        and dup_id != current_master_id
+                        and pair_key not in seen_pairs
+                    ):
+                        seen_pairs.add(pair_key)
+                        duplicate_ids.add(dup_id)
+                        synonyms.append({
+                            "type":           "duplicate",
+                            "duplicate_id":   dup_id,
+                            "original_id":    current_master_id,
+                            "duplicate_name": dup,
+                            "original_name":  current_master,
+                            "land":           dup_grp or current_group,
+                            "confidence_%":   100,
+                        })
             else:
                 unmatched_dupes.append((current_master or "", dup))
 
-    return synonyms, duplicate_ids, unmatched_masters, unmatched_dupes
+    # Neue DB-Einträge für ungematchte Master erzeugen
+    new_records: list[dict] = []
+    # Alle Spalten der Original-CSV für leere Felder
+    empty_row = {c: "" for c in df.columns}
+
+    for master_name, dup_entries in pending_new.items():
+        if not dup_entries:
+            continue
+        # Deterministische UUID (reproduzierbar über Sessions)
+        new_id  = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"growingregion:{master_name}"))
+        iso     = dup_entries[0][2] if dup_entries else ""
+        ctry_id = iso_to_country.get(iso, "")
+
+        # Neuen DB-Eintrag erstellen
+        rec = dict(empty_row)
+        if col_group and col_group in rec:
+            rec[col_group] = iso
+        if col_id in rec:
+            rec[col_id] = new_id
+        if col_name in rec:
+            rec[col_name] = master_name
+        # IsDeleted = 0
+        for c in df.columns:
+            if "isdeleted" in c.lower():
+                rec[c] = "0"
+        # CountryId
+        for c in df.columns:
+            if "countryid" in c.lower():
+                rec[c] = ctry_id
+        new_records.append(rec)
+
+        # Synonympaare für die gepufferten Duplikate erzeugen
+        for dup_name, dup_id, dup_grp in dup_entries:
+            pair_key = (new_id, dup_id)
+            if pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                duplicate_ids.add(dup_id)
+                synonyms.append({
+                    "type":           "duplicate",
+                    "duplicate_id":   dup_id,
+                    "original_id":    new_id,
+                    "duplicate_name": dup_name,
+                    "original_name":  master_name,
+                    "land":           dup_grp or iso,
+                    "confidence_%":   100,
+                })
+
+    return synonyms, duplicate_ids, unmatched_masters, unmatched_dupes, new_records
 
 
 def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
@@ -357,8 +437,9 @@ _defaults: dict = {
     # Bekannte Synonyme (aus Excel-Vorab-Kuratierung)
     "known_synonyms":              [],   # Liste von Synonym-Dicts
     "known_synonym_ids":           set(), # Duplikat-IDs (aus Fuzzy-Matching ausschließen)
-    "known_unmatched_masters":     [],   # Masternamen ohne CSV-Treffer
+    "known_unmatched_masters":     [],   # Masternamen ohne CSV-Treffer (aber neue UUID erzeugt)
     "known_unmatched_dupes":       [],   # (master, dup)-Paare ohne CSV-Treffer
+    "known_new_records":           [],   # Neue DB-Einträge für ungematchte Master
     "review_page":                 0,    # aktuelle Seite im Duplikat-Review
 }
 for _k, _v in _defaults.items():
@@ -436,6 +517,7 @@ with st.sidebar:
                 st.session_state.known_synonym_ids           = set()
                 st.session_state.known_unmatched_masters     = []
                 st.session_state.known_unmatched_dupes       = []
+                st.session_state.known_new_records           = []
                 st.session_state.file_load_count            += 1
 
                 # Vorab-Synonyme aus Excel laden (falls konfiguriert)
@@ -445,7 +527,7 @@ with st.sidebar:
                     _cname = df_new.columns[active_config["col_name"]]
                     _cgrp_idx = active_config.get("col_group")
                     _cgrp  = df_new.columns[_cgrp_idx] if _cgrp_idx is not None else None
-                    _syns, _dup_ids, _unm_m, _unm_d = load_known_synonyms(
+                    _syns, _dup_ids, _unm_m, _unm_d, _new_recs = load_known_synonyms(
                         xlsx_path, df_new, _cid, _cname, _cgrp,
                         split_dash=active_config.get("split_dash", False),
                     )
@@ -453,6 +535,7 @@ with st.sidebar:
                     st.session_state.known_synonym_ids       = _dup_ids
                     st.session_state.known_unmatched_masters = _unm_m
                     st.session_state.known_unmatched_dupes   = _unm_d
+                    st.session_state.known_new_records       = _new_recs
 
                 msg = f"✓ {len(df_new)} Zeilen geladen  \nKodierung: {enc}"
                 if st.session_state.known_synonyms:
@@ -726,12 +809,15 @@ if cfg.get("pre_known_synonyms_file"):
     unm_masters     = st.session_state.known_unmatched_masters
     unm_dupes       = st.session_state.known_unmatched_dupes
 
-    k1, k2, k3 = st.columns(3)
+    new_recs = st.session_state.known_new_records
+    k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.metric("Bekannte Synonympaare", len(known_syns))
     with k2:
-        st.metric("Master ohne CSV-Treffer", len(unm_masters))
+        st.metric("Neue DB-Einträge", len(new_recs))
     with k3:
+        st.metric("Master ohne CSV-Treffer", len(unm_masters))
+    with k4:
         st.metric("Duplikate ohne CSV-Treffer", len(unm_dupes))
 
     if known_syns:
@@ -751,8 +837,19 @@ if cfg.get("pre_known_synonyms_file"):
         else:
             st.caption("Keine Treffer in der CSV — Namen prüfen.")
 
+    if new_recs:
+        with st.expander(f"🆕 {len(new_recs)} neue Einträge für die Datenbank"):
+            st.caption(
+                "Diese Weinbauregionen fehlen in der CSV, werden aber als neue Einträge "
+                "mit generierter UUID angelegt. Duplikate werden auf sie gemappt."
+            )
+            st.dataframe(
+                pd.DataFrame(new_recs),
+                use_container_width=True, hide_index=True,
+            )
+
     if unm_masters:
-        with st.expander(f"⚠️ {len(unm_masters)} Master-Namen ohne CSV-Treffer"):
+        with st.expander(f"ℹ️ {len(unm_masters)} Master-Namen ohne CSV-Treffer (neue UUID erzeugt)"):
             for m in unm_masters:
                 st.write(f"- {m}")
 
@@ -1094,9 +1191,12 @@ if has_cuvee or has_non_masters:
     )
 
 # Download
-dcol1, dcol2 = st.columns(2)
+new_records = st.session_state.known_new_records
+has_new_records = bool(new_records)
+n_dl_cols = 3 if has_new_records else 2
+dcols = st.columns(n_dl_cols)
 
-with dcol1:
+with dcols[0]:
     csv_out = out_df.to_csv(sep=";", index=False).encode("utf-8-sig")
     extras  = ["`original_id`"]
     if cfg["cuvee_detection"]:
@@ -1110,7 +1210,7 @@ with dcol1:
     )
     st.caption(f"Gleiche Struktur + {' + '.join(extras)}")
 
-with dcol2:
+with dcols[1]:
     syn_name = cfg["out_file"].replace("_cleaned.csv", "_synonyms.csv")
     syn_out  = syn_df.to_csv(sep=";", index=False).encode("utf-8-sig")
     st.download_button(
@@ -1124,3 +1224,20 @@ with dcol2:
         "type=duplicate: Duplikate (Schritt 1+3)  |  "
         "type=cuvee: Blend-Cuvées → Master (Schritt 2)"
     )
+
+if has_new_records:
+    with dcols[2]:
+        new_df      = pd.DataFrame(new_records)
+        new_name    = cfg["out_file"].replace("_cleaned.csv", "_new_entries.csv")
+        new_out     = new_df.to_csv(sep=";", index=False).encode("utf-8-sig")
+        st.download_button(
+            "🆕 Neue DB-Einträge herunterladen",
+            data=new_out,
+            file_name=new_name,
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption(
+            f"{len(new_records)} neue Weinbauregionen mit generierter UUID — "
+            "direkt in die Datenbank einspielen"
+        )
