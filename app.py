@@ -52,6 +52,13 @@ FILE_CONFIGS = {
         "split_dash":      False,
         "cuvee_detection": False,
         "out_file":        "producer_cleaned.csv",
+        # Zusatz-Felder im Pair-Review
+        "detail_cols": [
+            (2,  "LongName"),
+            (5,  "Verifiziert"),
+            (8,  "Erstellt am"),
+            (12, "Gelöscht"),
+        ],
     },
     "product": {
         "label":              "Weine",
@@ -650,14 +657,38 @@ else:
                 st.write(f"{badge} **{score}%** — {status}")
 
                 left, mid, right = st.columns([4, 4, 3])
+
+                detail_cols = cfg.get("detail_cols", [])
+
+                def _detail_lines(entry_id: str) -> str:
+                    if not detail_cols:
+                        return ""
+                    rows = df[df[col_id] == entry_id]
+                    if rows.empty:
+                        return ""
+                    r = rows.iloc[0]
+                    parts = []
+                    for col_idx, col_label in detail_cols:
+                        val = r.iloc[col_idx] if col_idx < len(r) else ""
+                        val = str(val).strip()
+                        if val and val.upper() not in ("NULL", "NONE", ""):
+                            parts.append(f"**{col_label}:** {val}")
+                    return "  \n".join(parts)
+
                 with left:
                     st.markdown("**Eintrag A**")
                     st.markdown(f"```\n{pair['name_a']}\n```")
                     st.caption(f"ID: {pair['id_a']}")
+                    details_a = _detail_lines(pair["id_a"])
+                    if details_a:
+                        st.markdown(details_a)
                 with mid:
                     st.markdown("**Eintrag B**")
                     st.markdown(f"```\n{pair['name_b']}\n```")
                     st.caption(f"ID: {pair['id_b']}")
+                    details_b = _detail_lines(pair["id_b"])
+                    if details_b:
+                        st.markdown(details_b)
                 with right:
                     st.markdown("**Entscheidung**")
                     b1, b2, b3 = st.columns(3)
