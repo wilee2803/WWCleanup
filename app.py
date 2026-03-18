@@ -359,6 +359,7 @@ _defaults: dict = {
     "known_synonym_ids":           set(), # Duplikat-IDs (aus Fuzzy-Matching ausschließen)
     "known_unmatched_masters":     [],   # Masternamen ohne CSV-Treffer
     "known_unmatched_dupes":       [],   # (master, dup)-Paare ohne CSV-Treffer
+    "review_page":                 0,    # aktuelle Seite im Duplikat-Review
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -509,6 +510,7 @@ with st.sidebar:
                 )
             st.session_state.candidates  = cands
             st.session_state.decisions   = {}
+            st.session_state.review_page = 0
             st.session_state.analysis_count += 1
             if cands:
                 st.success(f"✓ {len(cands)} Duplikat-Kandidaten")
@@ -774,13 +776,59 @@ candidates = st.session_state.candidates
 if not candidates:
     st.success("✅ Keine Duplikate über dem Schwellwert gefunden.")
 else:
+    PAGE_SIZE = 25
+
+    total_pages = max(1, (len(candidates) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = st.session_state.review_page
+
     st.caption(
         "Für jedes Paar: Wähle, welcher Eintrag das **Original** ist — "
         "oder verwirf, wenn es kein Duplikat ist."
     )
 
+    # Paginierungs-Navigation
+    pn_left, pn_mid, pn_right = st.columns([2, 6, 2])
+    with pn_left:
+        if st.button("◀ Zurück", disabled=(page == 0), use_container_width=True):
+            st.session_state.review_page -= 1
+            st.rerun()
+    with pn_mid:
+        decided = len(st.session_state.decisions)
+        st.markdown(
+            f"<div style='text-align:center'>Seite {page+1} / {total_pages} &nbsp;·&nbsp; "
+            f"{decided} / {len(candidates)} entschieden</div>",
+            unsafe_allow_html=True,
+        )
+    with pn_right:
+        if st.button("Weiter ▶", disabled=(page >= total_pages - 1), use_container_width=True):
+            st.session_state.review_page += 1
+            st.rerun()
+
+    # Schneller ID-Index (einmal aufbauen, kein linearer Scan pro Paar)
+    detail_cols = cfg.get("detail_cols", [])
+    if detail_cols:
+        id_to_row = {str(r[col_id]): r for _, r in df.iterrows()}
+    else:
+        id_to_row = {}
+
+    def _detail_lines(entry_id: str) -> str:
+        if not detail_cols:
+            return ""
+        r = id_to_row.get(entry_id)
+        if r is None:
+            return ""
+        parts = []
+        for col_idx, col_label in detail_cols:
+            val = str(r.iloc[col_idx]).strip() if col_idx < len(r) else ""
+            if val and val.upper() not in ("NULL", "NONE", ""):
+                parts.append(f"**{col_label}:** {val}")
+        return "  \n".join(parts)
+
+    # Nur die aktuelle Seite rendern
+    page_candidates = candidates[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+
     by_group: dict[str, list] = {}
-    for c in candidates:
+    for c in page_candidates:
         by_group.setdefault(c["group"], []).append(c)
 
     for group_name, pairs in by_group.items():
@@ -792,9 +840,9 @@ else:
         ):
             # Wein-Kontext: gemeinsame Attribute einmalig pro Gruppe anzeigen
             if cfg.get("composite_group") and pairs:
-                ctx = df[df[col_id] == pairs[0]["id_a"]]
-                if not ctx.empty:
-                    r      = ctx.iloc[0]
+                ctx_rows = id_to_row.get(pairs[0]["id_a"])
+                if ctx_rows is not None:
+                    r       = ctx_rows
                     c_prod  = df.columns[cfg["col_producer_name"]]
                     c_type  = df.columns[cfg["col_wine_type_name"]]
                     c_year  = df.columns[cfg["col_year"]]
@@ -827,23 +875,6 @@ else:
                 st.write(f"{badge} **{score}%** — {status}")
 
                 left, mid, right = st.columns([4, 4, 3])
-
-                detail_cols = cfg.get("detail_cols", [])
-
-                def _detail_lines(entry_id: str) -> str:
-                    if not detail_cols:
-                        return ""
-                    rows = df[df[col_id] == entry_id]
-                    if rows.empty:
-                        return ""
-                    r = rows.iloc[0]
-                    parts = []
-                    for col_idx, col_label in detail_cols:
-                        val = r.iloc[col_idx] if col_idx < len(r) else ""
-                        val = str(val).strip()
-                        if val and val.upper() not in ("NULL", "NONE", ""):
-                            parts.append(f"**{col_label}:** {val}")
-                    return "  \n".join(parts)
 
                 with left:
                     st.markdown("**Eintrag A**")
@@ -882,6 +913,19 @@ else:
                             st.session_state.decisions[key] = "reject"
                             st.rerun()
                 st.divider()
+
+    # Paginierungs-Navigation (unten wiederholen)
+    pb_left, pb_mid, pb_right = st.columns([2, 6, 2])
+    with pb_left:
+        if st.button("◀ Zurück", key="page_prev_b", disabled=(page == 0),
+                     use_container_width=True):
+            st.session_state.review_page -= 1
+            st.rerun()
+    with pb_right:
+        if st.button("Weiter ▶", key="page_next_b", disabled=(page >= total_pages - 1),
+                     use_container_width=True):
+            st.session_state.review_page += 1
+            st.rerun()
 
 
 # ── Export ─────────────────────────────────────────────────────────────────────
