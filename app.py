@@ -32,15 +32,16 @@ FILE_CONFIGS = {
         "out_file":        "grapevariety_cleaned.csv",
     },
     "growingregion": {
-        "label":           "Weinbauregionen",
-        "file":            os.path.join(BASE_DIR, "Datafiles", "growingregion.csv"),
-        "col_id":          1,
-        "col_name":        3,
-        "col_group":       0,
-        "group_label":     "Land",
-        "split_dash":      True,
-        "cuvee_detection": False,
-        "out_file":        "growingregion_cleaned.csv",
+        "label":                  "Weinbauregionen",
+        "file":                   os.path.join(BASE_DIR, "Datafiles", "growingregion.csv"),
+        "col_id":                 1,
+        "col_name":               3,
+        "col_group":              0,
+        "group_label":            "Land",
+        "split_dash":             True,
+        "cuvee_detection":        False,
+        "out_file":               "growingregion_cleaned.csv",
+        "pre_known_synonyms_file": os.path.join(BASE_DIR, "Datafiles", "Dupletten_Weinbauregion.xlsx"),
     },
     "producer": {
         "label":           "Winzer",
@@ -186,6 +187,100 @@ def load_wine_type_mapping() -> dict:
         return _fallback
 
 
+def load_known_synonyms(
+    xlsx_path: str,
+    df: pd.DataFrame,
+    col_id: str,
+    col_name: str,
+    col_group: str | None,
+    split_dash: bool = True,
+) -> tuple[list[dict], set, list[str], list[tuple[str, str]]]:
+    """Lädt vorab bekannte Synonyme aus einer Excel-Datei (Dupletten_Weinbauregion.xlsx).
+
+    Struktur: Spalten 'Land', 'Weinbauregion' (Master), 'Duplikate'.
+    Weinbauregion wird vorwärts gefüllt; eine neue Master-Zeile erkennt man daran,
+    dass Weinbauregion in der Originaldatei befüllt ist.
+
+    Gibt zurück:
+        synonyms          – Liste von Synonym-Dicts (direkt in den Export-Pool)
+        duplicate_ids     – Set der Duplikat-IDs (werden aus Fuzzy-Matching ausgeschlossen)
+        unmatched_masters – Masternamen ohne Treffer in der CSV
+        unmatched_dupes   – (master_name, dup_name)-Paare ohne Treffer in der CSV
+    """
+    if not os.path.exists(xlsx_path):
+        return [], set(), [], []
+    try:
+        xl = pd.read_excel(xlsx_path)
+    except Exception:
+        return [], set(), [], []
+
+    # Lookup: normalisierter Name → (id, group_value)
+    name_to_row: dict[str, tuple[str, str]] = {}
+    for _, row in df.iterrows():
+        norm = normalize(str(row[col_name]), split_dash=split_dash)
+        if norm:
+            grp = str(row[col_group]) if col_group else ""
+            name_to_row[norm] = (str(row[col_id]), grp)
+
+    xl = xl.copy()
+    xl["_is_master"] = xl["Weinbauregion"].notna()
+    xl["Weinbauregion"] = xl["Weinbauregion"].ffill()
+
+    synonyms:          list[dict]         = []
+    duplicate_ids:     set                = set()
+    unmatched_masters: list[str]          = []
+    unmatched_dupes:   list[tuple[str, str]] = []
+    seen_pairs:        set                = set()
+
+    current_master:    str | None = None
+    current_master_id: str | None = None
+    current_group:     str        = ""
+
+    for _, row in xl.iterrows():
+        wb  = str(row.get("Weinbauregion", "")).strip()
+        dup = row.get("Duplikate", "")
+        dup = "" if pd.isna(dup) else str(dup).strip()
+
+        # Neue Master-Zeile
+        if row["_is_master"] and wb and wb != "nan":
+            current_master = wb
+            norm_master    = normalize(wb, split_dash=split_dash)
+            if norm_master in name_to_row:
+                current_master_id, current_group = name_to_row[norm_master]
+            else:
+                current_master_id = None
+                current_group     = ""
+                if wb not in unmatched_masters:
+                    unmatched_masters.append(wb)
+
+        # Duplikat verarbeiten
+        if dup and dup != "nan":
+            norm_dup = normalize(dup, split_dash=split_dash)
+            if norm_dup in name_to_row:
+                dup_id, dup_grp = name_to_row[norm_dup]
+                pair_key = (current_master_id, dup_id)
+                if (
+                    current_master_id
+                    and dup_id != current_master_id
+                    and pair_key not in seen_pairs
+                ):
+                    seen_pairs.add(pair_key)
+                    duplicate_ids.add(dup_id)
+                    synonyms.append({
+                        "type":           "duplicate",
+                        "duplicate_id":   dup_id,
+                        "original_id":    current_master_id,
+                        "duplicate_name": dup,
+                        "original_name":  current_master,
+                        "land":           dup_grp or current_group,
+                        "confidence_%":   100,
+                    })
+            else:
+                unmatched_dupes.append((current_master or "", dup))
+
+    return synonyms, duplicate_ids, unmatched_masters, unmatched_dupes
+
+
 def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
                     group_col: str | None, threshold: int,
                     split_dash: bool = False,
@@ -259,6 +354,11 @@ _defaults: dict = {
     "confirmed_cuvee_ids":         set(), # IDs bestätigter Blend-Cuvées (Schritt 2)
     "cuvee_master_per_group":      {},   # {group_val: master_id} aus Schritt 1
     "cuvee_master_non_master_ids": set(), # nicht-Master-Cuvée-IDs aus Schritt 1
+    # Bekannte Synonyme (aus Excel-Vorab-Kuratierung)
+    "known_synonyms":              [],   # Liste von Synonym-Dicts
+    "known_synonym_ids":           set(), # Duplikat-IDs (aus Fuzzy-Matching ausschließen)
+    "known_unmatched_masters":     [],   # Masternamen ohne CSV-Treffer
+    "known_unmatched_dupes":       [],   # (master, dup)-Paare ohne CSV-Treffer
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -331,8 +431,32 @@ with st.sidebar:
                 st.session_state.confirmed_cuvee_ids         = set()
                 st.session_state.cuvee_master_per_group      = {}
                 st.session_state.cuvee_master_non_master_ids = set()
+                st.session_state.known_synonyms              = []
+                st.session_state.known_synonym_ids           = set()
+                st.session_state.known_unmatched_masters     = []
+                st.session_state.known_unmatched_dupes       = []
                 st.session_state.file_load_count            += 1
-                st.success(f"✓ {len(df_new)} Zeilen geladen  \nKodierung: {enc}")
+
+                # Vorab-Synonyme aus Excel laden (falls konfiguriert)
+                xlsx_path = active_config.get("pre_known_synonyms_file")
+                if xlsx_path:
+                    _cid   = df_new.columns[active_config["col_id"]]
+                    _cname = df_new.columns[active_config["col_name"]]
+                    _cgrp_idx = active_config.get("col_group")
+                    _cgrp  = df_new.columns[_cgrp_idx] if _cgrp_idx is not None else None
+                    _syns, _dup_ids, _unm_m, _unm_d = load_known_synonyms(
+                        xlsx_path, df_new, _cid, _cname, _cgrp,
+                        split_dash=active_config.get("split_dash", False),
+                    )
+                    st.session_state.known_synonyms          = _syns
+                    st.session_state.known_synonym_ids       = _dup_ids
+                    st.session_state.known_unmatched_masters = _unm_m
+                    st.session_state.known_unmatched_dupes   = _unm_d
+
+                msg = f"✓ {len(df_new)} Zeilen geladen  \nKodierung: {enc}"
+                if st.session_state.known_synonyms:
+                    msg += f"  \n📌 {len(st.session_state.known_synonyms)} bekannte Synonyme geladen"
+                st.success(msg)
             else:
                 st.error("Datei konnte nicht gelesen werden.")
         else:
@@ -370,7 +494,8 @@ with st.sidebar:
                 # Aus Analyse ausschließen: bestätigte Blend-Cuvées + nicht-Master-Einträge
                 exclude = (
                     st.session_state.confirmed_cuvee_ids |
-                    st.session_state.cuvee_master_non_master_ids
+                    st.session_state.cuvee_master_non_master_ids |
+                    st.session_state.known_synonym_ids
                 )
                 cands = find_candidates(
                     st.session_state.df,
@@ -590,6 +715,51 @@ if cfg["cuvee_detection"]:
         )
 
 
+# ── Bekannte Synonyme (aus Excel-Vorab-Kuratierung) ────────────────────────────
+
+if cfg.get("pre_known_synonyms_file"):
+    st.divider()
+    st.subheader("📌 Bekannte Synonyme")
+    known_syns      = st.session_state.known_synonyms
+    unm_masters     = st.session_state.known_unmatched_masters
+    unm_dupes       = st.session_state.known_unmatched_dupes
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric("Bekannte Synonympaare", len(known_syns))
+    with k2:
+        st.metric("Master ohne CSV-Treffer", len(unm_masters))
+    with k3:
+        st.metric("Duplikate ohne CSV-Treffer", len(unm_dupes))
+
+    if known_syns:
+        with st.expander(f"{len(known_syns)} bekannte Synonyme anzeigen"):
+            st.caption(
+                "Diese Paare sind bereits kuratiert und werden direkt in den Export "
+                "übernommen. Die Duplikat-Einträge werden aus der Fuzzy-Analyse ausgeschlossen."
+            )
+            st.dataframe(
+                pd.DataFrame(known_syns).drop(columns="type"),
+                use_container_width=True, hide_index=True,
+            )
+    else:
+        xlsx_path = cfg["pre_known_synonyms_file"]
+        if not os.path.exists(xlsx_path):
+            st.caption("📁 Excel-Datei nicht gefunden — bitte lokal ablegen.")
+        else:
+            st.caption("Keine Treffer in der CSV — Namen prüfen.")
+
+    if unm_masters:
+        with st.expander(f"⚠️ {len(unm_masters)} Master-Namen ohne CSV-Treffer"):
+            for m in unm_masters:
+                st.write(f"- {m}")
+
+    if unm_dupes:
+        with st.expander(f"⚠️ {len(unm_dupes)} Duplikat-Namen ohne CSV-Treffer"):
+            for master, dup in unm_dupes:
+                st.write(f"- **{master}** ← {dup}")
+
+
 # ── SCHRITT 3: Duplikat-Review ─────────────────────────────────────────────────
 
 st.divider()
@@ -719,6 +889,7 @@ else:
 confirmed_pairs   = [(k, v) for k, v in st.session_state.decisions.items() if v != "reject"]
 has_cuvee         = (edited_cuvee is not None and bool(edited_cuvee["Cuvée"].any()))
 has_non_masters   = bool(st.session_state.cuvee_master_non_master_ids)
+has_known_syns    = bool(st.session_state.known_synonyms)
 all_pairs_decided = (len(st.session_state.decisions) == len(candidates))
 
 # Export erst anzeigen wenn alle Paare entschieden wurden
@@ -727,7 +898,7 @@ if not all_pairs_decided:
     st.info(f"⏳ Noch **{remaining}** Paare offen — bitte alle entscheiden, dann erscheint der Export.")
     st.stop()
 
-if not confirmed_pairs and not has_cuvee and not has_non_masters:
+if not confirmed_pairs and not has_cuvee and not has_non_masters and not has_known_syns:
     st.stop()
 
 st.divider()
@@ -834,9 +1005,25 @@ if cfg["cuvee_detection"]:
     for master_id in st.session_state.cuvee_master_per_group.values():
         out_df.loc[out_df[col_id] == master_id, "is_cuvee"] = "1"
 
+# Bekannte Synonyme aus Excel voranstellen
+if st.session_state.known_synonyms:
+    # "land"-Schlüssel auf den entity-spezifischen group_label-Key umbenennen
+    group_key = cfg["group_label"].lower()
+    for s in st.session_state.known_synonyms:
+        if "land" in s and group_key != "land":
+            s[group_key] = s.pop("land")
+    synonyms = st.session_state.known_synonyms + synonyms
+
 syn_df = pd.DataFrame(synonyms)
 
 # Vorschau
+if has_known_syns:
+    st.write(f"**{len(st.session_state.known_synonyms)} bekannte Synonyme** (aus Excel-Kuratierung):")
+    st.dataframe(
+        pd.DataFrame(st.session_state.known_synonyms).drop(columns="type"),
+        use_container_width=True, hide_index=True,
+    )
+
 if confirmed_pairs:
     n_dup = len(confirmed_pairs)
     st.write(f"**{n_dup} Duplikate** bestätigt (Schritt 3):")
