@@ -422,7 +422,7 @@ def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
 # ── Autosave ───────────────────────────────────────────────────────────────────
 
 def _autosave_path(entity_key: str) -> str:
-    return os.path.join(BASE_DIR, "Datafiles", f"_autosave_{entity_key}.json")
+    return os.path.join(BASE_DIR, f"_autosave_{entity_key}.json")
 
 
 def save_progress(entity_key: str, candidates: list, decisions: dict, review_page: int):

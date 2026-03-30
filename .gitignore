@@ -4,6 +4,9 @@ Datafiles/producer.csv
 Datafiles/grapevariety.csv
 Datafiles/growingregion.csv
 
+# Autosave-Dateien (temporärer Review-Fortschritt)
+_autosave_*.json
+
 # Python
 __pycache__/
 *.pyc
