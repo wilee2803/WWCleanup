@@ -5,6 +5,7 @@ Unterstützt: Rebsorten, Weinbauregionen, Winzer, Weine
 """
 
 import io
+import json
 import os
 import re
 import unicodedata
@@ -418,6 +419,51 @@ def find_candidates(df: pd.DataFrame, id_col: str, name_col: str,
     return sorted(candidates, key=lambda x: (-x["score"], x["group"], x["name_a"]))
 
 
+# ── Autosave ───────────────────────────────────────────────────────────────────
+
+def _autosave_path(entity_key: str) -> str:
+    return os.path.join(BASE_DIR, "Datafiles", f"_autosave_{entity_key}.json")
+
+
+def save_progress(entity_key: str, candidates: list, decisions: dict, review_page: int):
+    """Schreibt aktuellen Fortschritt in eine JSON-Datei (Sicherheitsnetz)."""
+    try:
+        data = {
+            "entity_key":  entity_key,
+            "candidates":  candidates,
+            "decisions":   {f"{k[0]}|||{k[1]}": v for k, v in decisions.items()},
+            "review_page": review_page,
+        }
+        with open(_autosave_path(entity_key), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def load_progress(entity_key: str) -> dict | None:
+    """Lädt gespeicherten Fortschritt. Gibt None zurück wenn keine Datei vorhanden."""
+    path = _autosave_path(entity_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["decisions"] = {
+            tuple(k.split("|||")): v for k, v in data["decisions"].items()
+        }
+        return data
+    except Exception:
+        return None
+
+
+def delete_progress(entity_key: str):
+    """Löscht die Autosave-Datei."""
+    try:
+        os.remove(_autosave_path(entity_key))
+    except Exception:
+        pass
+
+
 # ── Session State Init ─────────────────────────────────────────────────────────
 
 _defaults: dict = {
@@ -608,6 +654,32 @@ with st.sidebar:
             decided / total if total else 0,
             text=f"Duplikate: {decided} / {total} entschieden",
         )
+
+    # Autosave: Wiederherstellung anbieten wenn noch keine Analyse läuft
+    if st.session_state.candidates is None:
+        _saved = load_progress(selected_key)
+        if _saved:
+            n_saved = len(_saved["decisions"])
+            n_cands = len(_saved["candidates"])
+            st.divider()
+            st.info(
+                f"💾 **Autosave gefunden**  \n"
+                f"{n_saved} / {n_cands} Entscheidungen gespeichert"
+            )
+            _rc, _dc = st.columns(2)
+            with _rc:
+                if st.button("🔄 Wiederherstellen", use_container_width=True,
+                             help="Fortschritt aus letzter Sitzung laden"):
+                    st.session_state.candidates   = _saved["candidates"]
+                    st.session_state.decisions    = _saved["decisions"]
+                    st.session_state.review_page  = _saved["review_page"]
+                    st.session_state.analysis_count += 1
+                    st.rerun()
+            with _dc:
+                if st.button("🗑️ Löschen", use_container_width=True,
+                             help="Autosave verwerfen"):
+                    delete_progress(selected_key)
+                    st.rerun()
 
 
 # ── Hauptbereich ───────────────────────────────────────────────────────────────
@@ -887,6 +959,7 @@ else:
     pn_left, pn_mid, pn_right = st.columns([2, 6, 2])
     with pn_left:
         if st.button("◀ Zurück", disabled=(page == 0), use_container_width=True):
+            save_progress(selected_key, candidates, st.session_state.decisions, page - 1)
             st.session_state.review_page -= 1
             st.rerun()
     with pn_mid:
@@ -898,6 +971,7 @@ else:
         )
     with pn_right:
         if st.button("Weiter ▶", disabled=(page >= total_pages - 1), use_container_width=True):
+            save_progress(selected_key, candidates, st.session_state.decisions, page + 1)
             st.session_state.review_page += 1
             st.rerun()
 
@@ -1016,11 +1090,13 @@ else:
     with pb_left:
         if st.button("◀ Zurück", key="page_prev_b", disabled=(page == 0),
                      use_container_width=True):
+            save_progress(selected_key, candidates, st.session_state.decisions, page - 1)
             st.session_state.review_page -= 1
             st.rerun()
     with pb_right:
         if st.button("Weiter ▶", key="page_next_b", disabled=(page >= total_pages - 1),
                      use_container_width=True):
+            save_progress(selected_key, candidates, st.session_state.decisions, page + 1)
             st.session_state.review_page += 1
             st.rerun()
 
