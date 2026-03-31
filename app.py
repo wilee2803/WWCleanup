@@ -654,6 +654,17 @@ with st.sidebar:
             decided / total if total else 0,
             text=f"Duplikate: {decided} / {total} entschieden",
         )
+        _as_path = _autosave_path(selected_key)
+        if os.path.exists(_as_path):
+            with open(_as_path, "rb") as _af:
+                st.download_button(
+                    "⬇️ Fortschritt sichern",
+                    data=_af.read(),
+                    file_name=f"_autosave_{selected_key}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    help="Entscheidungen lokal sichern — kann nach Redeploy wieder importiert werden",
+                )
 
     # Autosave: Wiederherstellung anbieten wenn noch keine Analyse läuft
     if st.session_state.candidates is None:
@@ -680,6 +691,35 @@ with st.sidebar:
                              help="Autosave verwerfen"):
                     delete_progress(selected_key)
                     st.rerun()
+            with open(_autosave_path(selected_key), "rb") as _af:
+                st.download_button(
+                    "⬇️ Autosave sichern",
+                    data=_af.read(),
+                    file_name=f"_autosave_{selected_key}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    help="JSON lokal speichern — kann nach Redeploy wieder importiert werden",
+                )
+        elif analyse_ready:
+            st.divider()
+            _up = st.file_uploader(
+                "📂 Autosave importieren",
+                type=["json"],
+                help="Zuvor gesichertes Autosave-JSON hochladen",
+            )
+            if _up is not None:
+                try:
+                    _imp = json.loads(_up.read())
+                    _imp["decisions"] = {
+                        tuple(k.split("|||")): v for k, v in _imp["decisions"].items()
+                    }
+                    st.session_state.candidates      = _imp["candidates"]
+                    st.session_state.decisions       = _imp["decisions"]
+                    st.session_state.review_page     = _imp["review_page"]
+                    st.session_state.analysis_count += 1
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Import fehlgeschlagen: {_e}")
 
 
 # ── Hauptbereich ───────────────────────────────────────────────────────────────
@@ -1064,7 +1104,7 @@ else:
                 with right:
                     st.markdown("**Entscheidung**")
                     b1, b2, b3 = st.columns(3)
-                    uid = f"{key[0][:6]}_{key[1][:6]}"
+                    uid = f"{key[0].replace('-', '')}_{key[1].replace('-', '')}"
                     with b1:
                         if st.button("A=Orig", key=f"a_{uid}",
                                      type="primary" if decision == "original_a" else "secondary",
